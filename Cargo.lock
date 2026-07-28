@@ -1995,6 +1995,7 @@ dependencies = [
  "dirs",
  "evdev",
  "futures-util",
+ "libc",
  "reqwest",
  "rustls",
  "serde",

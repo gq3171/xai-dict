@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::hotkey;
 use crate::notify;
 use crate::output;
-use crate::pipeline::{self, LiveCapture};
+use crate::pipeline::{self, DualEvent, LiveCapture};
 use crate::stream_vad::{SpeechSegment, VadConfig};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -459,16 +459,11 @@ async fn start_recording(cfg: &Config) -> Result<RecordingSession> {
     };
 
     let stream_join = if dual {
-        let chunks = capture
-            .take_chunk_rx()
-            .expect("dual capture must expose chunk_rx");
-        let segs = capture
-            .take_segment_rx()
-            .expect("dual capture must expose segment_rx");
+        let events = capture
+            .take_dual_rx()
+            .expect("dual capture must expose dual_rx");
         let cfg_s = cfg.clone();
-        Some(tokio::spawn(async move {
-            dual_worker(cfg_s, chunks, segs).await
-        }))
+        Some(tokio::spawn(async move { dual_worker(cfg_s, events).await }))
     } else if use_stream {
         let rx = capture
             .take_segment_rx()
@@ -487,19 +482,19 @@ async fn start_recording(cfg: &Config) -> Result<RecordingSession> {
     })
 }
 
-/// Dual-model live path:
-/// - Zipformer: continuous partials → fcitx Preedit (字级观感)
-/// - Qwen3: on each VAD phrase → Commit final (高准)
+/// Dual-model live path (ordered events: Chunk then Segment for each phrase):
+/// - Zipformer: continuous partials → fcitx Preedit
+/// - Qwen3: on each VAD phrase → Commit final
 async fn dual_worker(
     cfg: Config,
-    mut chunks: mpsc::UnboundedReceiver<Vec<u8>>,
-    mut segs: mpsc::UnboundedReceiver<SpeechSegment>,
+    mut events: mpsc::UnboundedReceiver<DualEvent>,
 ) -> StreamOutcome {
     let mut committed = String::new();
     let mut phrases = 0u32;
     let mut last_partial = String::new();
+    // True after at least one VAD finalize ran this session.
+    let mut any_vad_finalize = false;
 
-    // Ensure workers warm (no-op if preloaded).
     let sdir = std::path::PathBuf::from(&cfg.stream_model_dir);
     let qdir = std::path::PathBuf::from(&cfg.qwen3_model_dir);
     let thr = cfg.stream_threads;
@@ -513,120 +508,127 @@ async fn dual_worker(
     })
     .await;
 
-    if let Err(e) = crate::local_stream::start_utterance() {
-        tracing::warn!("zipformer START failed: {e:#} — falling back phrase-only");
-        // Drain chunks, only use segments via stream_worker logic.
-        while chunks.recv().await.is_some() {}
-        return stream_worker(cfg, segs).await;
+    let start_ok = tokio::task::spawn_blocking(crate::local_stream::start_utterance)
+        .await
+        .unwrap_or(Err(anyhow::anyhow!("join")));
+    if let Err(e) = start_ok {
+        tracing::warn!("zipformer START failed: {e:#} — phrase-only fallback");
+        // Convert remaining dual events to segments only.
+        let (stx, srx) = mpsc::unbounded_channel();
+        while let Some(ev) = events.recv().await {
+            if let DualEvent::Segment(s) = ev {
+                let _ = stx.send(s);
+            }
+        }
+        drop(stx);
+        return stream_worker(cfg, srx).await;
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let mut segs_done = false;
-    let mut chunks_done = false;
-    while !(segs_done && chunks_done) {
-        tokio::select! {
-            seg = segs.recv(), if !segs_done => {
-                match seg {
-                    None => segs_done = true,
-                    Some(seg) => {
-                        let secs = seg.pcm.len() as f64 / (cfg.sample_rate as f64 * 2.0);
-                        tracing::info!(secs, "dual: VAD phrase → Qwen3 finalize");
+    while let Some(ev) = events.recv().await {
+        match ev {
+            DualEvent::Chunk(chunk) => {
+                let chunk = chunk.clone();
+                let res = tokio::task::spawn_blocking(move || crate::local_stream::feed_pcm(&chunk))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}")));
+                match res {
+                    Ok(partial) => {
+                        if partial.text != last_partial {
+                            last_partial = partial.text;
+                            let t = last_partial.clone();
+                            let _ = tokio::task::spawn_blocking(move || output::set_preedit(&t))
+                                .await;
+                        }
+                        // Ignore Zipformer endpoint; VAD owns phrase cuts.
+                    }
+                    Err(e) => tracing::debug!("zipformer feed: {e:#}"),
+                }
+            }
+            DualEvent::Segment(seg) => {
+                any_vad_finalize = true;
+                let secs = seg.pcm.len() as f64 / (cfg.sample_rate as f64 * 2.0);
+                tracing::info!(secs, "dual: VAD phrase → Qwen3 finalize");
 
-                        // Prefer Qwen3. Only fall back to Zipformer partial when
-                        // it is reasonably long (avoid committing garbage after
-                        // a mid-cut empty decode).
-                        let qwen = match pipeline::transcribe_pcm(
-                            &cfg,
-                            cfg.sample_rate,
-                            &seg.pcm,
-                        )
-                        .await
-                        {
-                            Ok(t) => t.trim().to_string(),
-                            Err(e) => {
-                                tracing::debug!("Qwen3 finalize fail: {e:#}");
-                                String::new()
-                            }
-                        };
-                        let final_text = if !qwen.is_empty() {
-                            qwen
-                        } else if last_partial.chars().count() >= 2 {
-                            tracing::info!(
-                                n = last_partial.len(),
-                                "Qwen3 empty — using Zipformer partial as fallback"
-                            );
-                            last_partial.clone()
-                        } else {
+                let qwen_text =
+                    match pipeline::transcribe_pcm(&cfg, cfg.sample_rate, &seg.pcm).await {
+                        Ok(t) => t.trim().to_string(),
+                        Err(e) => {
+                            tracing::debug!("Qwen3 finalize fail: {e:#}");
                             String::new()
-                        };
-                        last_partial.clear();
-                        output::clear_preedit();
+                        }
+                    };
 
-                        if final_text.is_empty() {
-                            tracing::debug!("skip empty finalize (no good partial either)");
-                            let _ = crate::local_stream::start_utterance();
-                            continue;
-                        }
+                let final_text = if !qwen_text.is_empty() {
+                    qwen_text
+                } else if last_partial.chars().count() >= 2 {
+                    tracing::info!(
+                        n = last_partial.len(),
+                        "Qwen3 empty — Zipformer partial fallback"
+                    );
+                    last_partial.clone()
+                } else {
+                    String::new()
+                };
+                last_partial.clear();
+                let _ = tokio::task::spawn_blocking(output::clear_preedit).await;
 
-                        match output::commit_final(&final_text, cfg.paste) {
-                            Ok(true) => {
-                                append_phrase(&mut committed, &final_text);
-                                phrases += 1;
-                                tracing::info!(
-                                    n = final_text.len(),
-                                    phrases,
-                                    "dual: committed (Qwen3)"
-                                );
-                            }
-                            Ok(false) => {
-                                append_phrase(&mut committed, &final_text);
-                                phrases += 1;
-                                tracing::warn!("dual: commit failed, text kept in report");
-                            }
-                            Err(e) => tracing::warn!("dual commit: {e:#}"),
-                        }
-                        let _ = crate::local_stream::start_utterance();
-                    }
+                if final_text.is_empty() {
+                    tracing::debug!("skip empty finalize");
+                    let _ = tokio::task::spawn_blocking(crate::local_stream::start_utterance).await;
+                    continue;
                 }
-            }
-            chunk = chunks.recv(), if !chunks_done => {
-                match chunk {
-                    None => chunks_done = true,
-                    Some(chunk) => {
-                        match crate::local_stream::feed_pcm(&chunk) {
-                            Ok(partial) => {
-                                if partial.text != last_partial {
-                                    last_partial = partial.text.clone();
-                                    output::set_preedit(&last_partial);
-                                }
-                                if partial.is_final {
-                                    // Zipformer endpoint only refreshes stream; VAD owns commit.
-                                    let _ = crate::local_stream::start_utterance();
-                                }
-                            }
-                            Err(e) => tracing::debug!("zipformer feed: {e:#}"),
-                        }
+
+                let paste = cfg.paste;
+                let text_c = final_text.clone();
+                let committed_ok = tokio::task::spawn_blocking(move || {
+                    output::commit_final(&text_c, paste)
+                })
+                .await
+                .unwrap_or(Ok(false));
+
+                match committed_ok {
+                    Ok(true) => {
+                        append_phrase(&mut committed, &final_text);
+                        phrases += 1;
+                        tracing::info!(
+                            n = final_text.len(),
+                            phrases,
+                            "dual: committed (Qwen3)"
+                        );
                     }
+                    Ok(false) => {
+                        append_phrase(&mut committed, &final_text);
+                        phrases += 1;
+                        tracing::warn!("dual: commit failed, text kept in report");
+                    }
+                    Err(e) => tracing::warn!("dual commit: {e:#}"),
                 }
+
+                let _ = tokio::task::spawn_blocking(crate::local_stream::start_utterance).await;
             }
         }
     }
 
-    // Leftover streaming partial (no VAD cut).
-    if !last_partial.is_empty() {
-        output::clear_preedit();
+    // Leftover preedit: only if VAD never finalized (short utterance / no silence).
+    // If VAD already committed phrases, leftover is usually contamination — clear only.
+    let _ = tokio::task::spawn_blocking(output::clear_preedit).await;
+    if !last_partial.is_empty() && !any_vad_finalize {
         let t = last_partial.clone();
-        let _ = output::commit_final(&t, cfg.paste);
-        if !committed.contains(&t) {
-            append_phrase(&mut committed, &t);
+        let paste = cfg.paste;
+        let ok = tokio::task::spawn_blocking(move || output::commit_final(&t, paste))
+            .await
+            .unwrap_or(Ok(false))
+            .unwrap_or(false);
+        if ok || !last_partial.is_empty() {
+            append_phrase(&mut committed, &last_partial);
             phrases += 1;
+            tracing::info!(n = last_partial.len(), "dual: leftover partial committed");
         }
-    } else {
-        output::clear_preedit();
     }
 
-    let _ = crate::local_stream::finish_utterance();
+    let _ = tokio::task::spawn_blocking(crate::local_stream::finish_utterance).await;
 
     StreamOutcome {
         committed,
@@ -721,23 +723,46 @@ async fn finish_and_deliver(cfg: &Config, sess: RecordingSession) -> Result<Stri
 
     if streaming {
         // Wait for in-flight phrase ASR + final flushed segment.
-        let outcome = if let Some(j) = stream_join {
-            j.await.unwrap_or(StreamOutcome {
-                committed: String::new(),
-                phrases: 0,
-            })
-        } else {
-            StreamOutcome {
-                committed: String::new(),
-                phrases: 0,
+        let (outcome, join_failed) = if let Some(j) = stream_join {
+            match j.await {
+                Ok(o) => (o, false),
+                Err(e) => {
+                    tracing::error!("stream worker join error: {e}");
+                    // Do NOT fall back to full-buffer re-paste — live commits may
+                    // already be on screen (would double-insert).
+                    (
+                        StreamOutcome {
+                            committed: String::new(),
+                            phrases: 0,
+                        },
+                        true,
+                    )
+                }
             }
+        } else {
+            (
+                StreamOutcome {
+                    committed: String::new(),
+                    phrases: 0,
+                },
+                false,
+            )
         };
 
         tracing::info!(
             phrases = outcome.phrases,
             n = outcome.committed.len(),
+            join_failed,
             "stream session complete"
         );
+
+        if join_failed {
+            let _ = tokio::task::spawn_blocking(output::clear_preedit).await;
+            if outcome.committed.is_empty() {
+                bail!("识别任务异常结束（已避免重复上屏）");
+            }
+            return Ok(outcome.committed);
+        }
 
         if outcome.committed.is_empty() {
             // No phrase committed (very short / quiet) — fall back to full-buffer ASR.

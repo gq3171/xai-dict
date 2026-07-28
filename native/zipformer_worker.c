@@ -194,10 +194,25 @@ int main(int argc, char **argv) {
     }
     if (strncmp(line, "PCM ", 4) == 0) {
       long nbytes = strtol(line + 4, NULL, 10);
-      if (nbytes <= 0 || nbytes > 16 * 1024 * 1024 || (nbytes % 2) != 0) {
+      /* Always consume the declared binary payload so the protocol stays aligned. */
+      int bad = (nbytes <= 0 || nbytes > 16 * 1024 * 1024 || (nbytes % 2) != 0);
+
+      if (bad) {
+        if (nbytes > 0 && nbytes <= 16 * 1024 * 1024) {
+          /* Discard declared payload even when size is odd/invalid. */
+          char discard[4096];
+          long left = nbytes;
+          while (left > 0) {
+            size_t want = (size_t)(left > (long)sizeof(discard) ? sizeof(discard) : left);
+            size_t r = fread(discard, 1, want, stdin);
+            if (r == 0) {
+              break;
+            }
+            left -= (long)r;
+          }
+        }
         printf("ERR bad PCM size\n");
         fflush(stdout);
-        /* drain bad payload if any */
         continue;
       }
       if (!stream) {
@@ -205,6 +220,17 @@ int main(int argc, char **argv) {
       }
       unsigned char *buf = (unsigned char *)malloc((size_t)nbytes);
       if (!buf) {
+        /* Still drain stdin payload. */
+        char discard[4096];
+        long left = nbytes;
+        while (left > 0) {
+          size_t want = (size_t)(left > (long)sizeof(discard) ? sizeof(discard) : left);
+          size_t r = fread(discard, 1, want, stdin);
+          if (r == 0) {
+            break;
+          }
+          left -= (long)r;
+        }
         printf("ERR oom\n");
         fflush(stdout);
         continue;
@@ -227,12 +253,9 @@ int main(int argc, char **argv) {
       feed_s16(rec, stream, sample_rate, (const int16_t *)buf, nsamp);
       free(buf);
 
-      if (SherpaOnnxOnlineStreamIsEndpoint(rec, stream)) {
-        emit_partial(rec, stream, 1);
-        SherpaOnnxOnlineStreamReset(rec, stream);
-      } else {
-        emit_partial(rec, stream, 0);
-      }
+      /* Dual-model: VAD owns phrase cuts. Do not auto-reset on Zipformer endpoint
+       * (would desync from Qwen3 finalize). Just report partial text. */
+      emit_partial(rec, stream, 0);
       continue;
     }
     printf("ERR unknown command\n");

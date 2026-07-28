@@ -75,10 +75,11 @@ pub async fn transcribe_pcm(cfg: &Config, sample_rate: u32, pcm: &[u8]) -> Resul
     }
     let prepared = wav::pcm16_prepare_for_asr(pcm, sample_rate);
     let tmp = std::env::temp_dir().join(format!(
-        "xai-dict-seg-{}.wav",
+        "xai-dict-seg-{}-{}.wav",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
+            .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
     wav::write_pcm16_mono_wav(&tmp, sample_rate, &prepared)?;
@@ -135,7 +136,16 @@ pub fn pcm_to_temp_wav(sample_rate: u32, pcm: &[u8]) -> Result<PathBuf> {
     Ok(tmp)
 }
 
-/// Live mic session. Optionally streams speech segments / raw chunks.
+/// Ordered dual-model events: chunks always precede any segment they produce.
+#[derive(Debug)]
+pub enum DualEvent {
+    /// Even-length s16le mono PCM.
+    Chunk(Vec<u8>),
+    /// Completed VAD speech phrase (after the chunks that formed it).
+    Segment(SpeechSegment),
+}
+
+/// Live mic session. Optionally streams speech segments / ordered dual events.
 pub struct LiveCapture {
     pub handle: capture::CaptureHandle,
     /// Full PCM (for final flush / non-stream path).
@@ -143,8 +153,8 @@ pub struct LiveCapture {
     collect: tokio::task::JoinHandle<()>,
     /// Completed speech phrases (phrase streaming mode).
     segment_rx: Option<mpsc::UnboundedReceiver<SpeechSegment>>,
-    /// Raw PCM chunks (dual-model live path).
-    chunk_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// Ordered dual-model event stream (chunks then segments).
+    dual_rx: Option<mpsc::UnboundedReceiver<DualEvent>>,
 }
 
 impl LiveCapture {
@@ -156,25 +166,25 @@ impl LiveCapture {
         Self::start_inner(sample_rate, Some(vad), false)
     }
 
-    /// Dual-model: raw chunks for Zipformer + VAD segments for Qwen3 finalize.
+    /// Dual-model: ordered Chunk/Segment events for Zipformer + Qwen3.
     pub fn start_dual(sample_rate: u32, vad: VadConfig) -> Result<Self> {
         Self::start_inner(sample_rate, Some(vad), true)
     }
 
-    fn start_inner(sample_rate: u32, vad: Option<VadConfig>, fanout_chunks: bool) -> Result<Self> {
+    fn start_inner(sample_rate: u32, vad: Option<VadConfig>, dual: bool) -> Result<Self> {
         let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<u8>>(64);
         let handle = capture::spawn_pcm_capture(sample_rate, pcm_tx)?;
         let pcm = Arc::new(Mutex::new(Vec::new()));
         let pcm_c = pcm.clone();
 
-        let (seg_tx, seg_rx) = if vad.is_some() {
+        let (seg_tx, seg_rx) = if vad.is_some() && !dual {
             let (t, r) = mpsc::unbounded_channel();
             (Some(t), Some(r))
         } else {
             (None, None)
         };
 
-        let (chunk_tx, chunk_rx) = if fanout_chunks {
+        let (dual_tx, dual_rx) = if dual {
             let (t, r) = mpsc::unbounded_channel();
             (Some(t), Some(r))
         } else {
@@ -183,23 +193,51 @@ impl LiveCapture {
 
         let collect = tokio::spawn(async move {
             let mut segmenter = vad.map(Segmenter::new);
-            while let Some(chunk) = pcm_rx.recv().await {
+            // Carry a leftover odd byte so dual PCM is always even s16 frames.
+            let mut odd_carry: Option<u8> = None;
+
+            while let Some(mut chunk) = pcm_rx.recv().await {
                 {
                     let mut g = pcm_c.lock().await;
                     g.extend_from_slice(&chunk);
                 }
-                if let Some(tx) = chunk_tx.as_ref() {
-                    let _ = tx.send(chunk.clone());
+
+                // Align s16le for dual/stream path.
+                if dual {
+                    if let Some(b) = odd_carry.take() {
+                        let mut aligned = Vec::with_capacity(chunk.len() + 1);
+                        aligned.push(b);
+                        aligned.extend_from_slice(&chunk);
+                        chunk = aligned;
+                    }
+                    if chunk.len() % 2 == 1 {
+                        odd_carry = chunk.pop();
+                    }
                 }
-                if let (Some(seg), Some(tx)) = (segmenter.as_mut(), seg_tx.as_ref()) {
+
+                if let Some(tx) = dual_tx.as_ref() {
+                    if !chunk.is_empty() {
+                        let _ = tx.send(DualEvent::Chunk(chunk.clone()));
+                    }
+                }
+
+                if let Some(seg) = segmenter.as_mut() {
                     for s in seg.push(&chunk) {
-                        let _ = tx.send(s);
+                        if let Some(tx) = dual_tx.as_ref() {
+                            let _ = tx.send(DualEvent::Segment(s));
+                        } else if let Some(tx) = seg_tx.as_ref() {
+                            let _ = tx.send(s);
+                        }
                     }
                 }
             }
-            if let (Some(seg), Some(tx)) = (segmenter.as_mut(), seg_tx.as_ref()) {
+            if let Some(seg) = segmenter.as_mut() {
                 if let Some(s) = seg.flush() {
-                    let _ = tx.send(s);
+                    if let Some(tx) = dual_tx.as_ref() {
+                        let _ = tx.send(DualEvent::Segment(s));
+                    } else if let Some(tx) = seg_tx.as_ref() {
+                        let _ = tx.send(s);
+                    }
                 }
             }
         });
@@ -209,7 +247,7 @@ impl LiveCapture {
             pcm,
             collect,
             segment_rx: seg_rx,
-            chunk_rx,
+            dual_rx,
         })
     }
 
@@ -217,8 +255,8 @@ impl LiveCapture {
         self.segment_rx.take()
     }
 
-    pub fn take_chunk_rx(&mut self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
-        self.chunk_rx.take()
+    pub fn take_dual_rx(&mut self) -> Option<mpsc::UnboundedReceiver<DualEvent>> {
+        self.dual_rx.take()
     }
 
     /// Stop capture and return all accumulated PCM.

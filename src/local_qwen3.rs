@@ -33,7 +33,9 @@ pub fn ensure_warm(
     max_new_tokens: u32,
     hotwords: &str,
 ) -> Result<()> {
-    let mut g = WORKER.lock().expect("worker mutex");
+    let mut g = WORKER
+        .lock()
+        .map_err(|_| anyhow::anyhow!("qwen3 mutex poisoned"))?;
     if let Some(w) = g.as_mut() {
         // Health check: process still alive?
         match w.child.try_wait() {
@@ -78,7 +80,9 @@ pub fn transcribe_file(
 }
 
 fn warm_transcribe(wav: &Path) -> Result<String> {
-    let mut g = WORKER.lock().expect("worker mutex");
+    let mut g = WORKER
+        .lock()
+        .map_err(|_| anyhow::anyhow!("qwen3 mutex poisoned"))?;
     let w = g
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("warm worker not started"))?;
@@ -92,13 +96,14 @@ fn warm_transcribe(wav: &Path) -> Result<String> {
     writeln!(w.stdin, "WAV {path_s}").context("write WAV cmd")?;
     w.stdin.flush().context("flush WAV cmd")?;
 
-    let mut line = String::new();
-    // Decode can take a few seconds for long audio; short phrases ~0.5s.
-    // Blocking read is fine — callers already use spawn_blocking.
-    w.stdout
-        .read_line(&mut line)
-        .context("read worker reply")?;
-    let line = line.trim_end_matches(['\r', '\n']);
+    // Decode: short phrases ~0.5s; long audio can be a few seconds. Cap at 45s.
+    let line = match read_line_timeout(w, Duration::from_secs(45)) {
+        Ok(l) => l,
+        Err(e) => {
+            *g = None; // force restart next call
+            return Err(e);
+        }
+    };
     let elapsed = t0.elapsed();
 
     if let Some(text) = line.strip_prefix("OK ") {
@@ -110,7 +115,6 @@ fn warm_transcribe(wav: &Path) -> Result<String> {
         return Ok(text.to_string());
     }
     if line == "OK" || line.starts_with("OK") {
-        // empty transcript
         tracing::info!(ms = elapsed.as_millis() as u64, "qwen3 warm decode empty");
         return Ok(String::new());
     }
@@ -118,6 +122,45 @@ fn warm_transcribe(wav: &Path) -> Result<String> {
         bail!("qwen3_worker: {err}");
     }
     bail!("qwen3_worker bad reply: {line}");
+}
+
+fn read_line_timeout(w: &mut WarmWorker, timeout: Duration) -> Result<String> {
+    use std::io::BufRead;
+    use std::os::fd::AsRawFd;
+    let fd = w.stdout.get_ref().as_raw_fd();
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Already buffered?
+        {
+            let buf = w.stdout.fill_buf().context("qwen3 fill_buf")?;
+            if !buf.is_empty() {
+                let mut line = String::new();
+                w.stdout
+                    .read_line(&mut line)
+                    .context("qwen3 read_line")?;
+                return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = w.child.kill();
+            bail!("qwen3 read timeout");
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remain = deadline.saturating_duration_since(Instant::now());
+        let ms = remain.as_millis().min(i32::MAX as u128) as i32;
+        let pr = unsafe { libc::poll(&mut pfd, 1, ms.max(1)) };
+        if pr < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            bail!("qwen3 poll: {err}");
+        }
+    }
 }
 
 fn spawn_worker(

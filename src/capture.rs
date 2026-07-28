@@ -176,11 +176,23 @@ pub fn spawn_pcm_capture(sample_rate: u32, tx: mpsc::Sender<Vec<u8>>) -> Result<
         .name("mic-capture".into())
         .spawn(move || {
             let mut buf = vec![0u8; READ_CHUNK];
+            // Keep s16le frames aligned across short reads.
+            let mut carry: Option<u8> = None;
             while !stop_t.load(Ordering::Relaxed) {
                 match stdout.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let chunk = buf[..n].to_vec();
+                        let mut chunk = Vec::with_capacity(n + 1);
+                        if let Some(b) = carry.take() {
+                            chunk.push(b);
+                        }
+                        chunk.extend_from_slice(&buf[..n]);
+                        if chunk.len() % 2 == 1 {
+                            carry = chunk.pop();
+                        }
+                        if chunk.is_empty() {
+                            continue;
+                        }
                         // Bridge to async channel: block if full.
                         if tx.blocking_send(chunk).is_err() {
                             break;

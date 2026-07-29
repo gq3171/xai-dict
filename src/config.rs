@@ -59,10 +59,32 @@ pub struct Config {
     pub stream_min_speech_ms: u32,
     /// Dual-model: Zipformer streaming preedit + Qwen3 final commit.
     pub dual_model: bool,
+    /// Show Zipformer text as fcitx preedit while speaking.
+    /// Final commit is always Qwen3; preedit is provisional and filtered for stability.
+    /// Set false if live text jumps too much vs the final result.
+    #[serde(default = "default_true")]
+    pub dual_preedit: bool,
     /// Streaming Zipformer model directory (zh-int8 online transducer).
     pub stream_model_dir: String,
     /// Threads for the streaming Zipformer worker (keep low; real-time).
     pub stream_threads: u32,
+    /// Prefer close-talk mic; reject quieter bystander / far-field speech.
+    /// Limits AGC boost and raises VAD energy gates. Keep true for office/open space.
+    #[serde(default = "default_true")]
+    pub near_field: bool,
+    /// Absolute VAD speech RMS (s16 scale, after light AGC). 0 = auto from near_field.
+    #[serde(default)]
+    pub vad_speech_rms: f64,
+    /// Speech must be this many × ambient noise floor (adaptive). 0 = auto.
+    #[serde(default)]
+    pub vad_snr: f64,
+    /// Max software mic gain. 0 = auto (near_field → 4×, else 12×). Cap stops amplifying bystanders.
+    #[serde(default)]
+    pub agc_max_gain: f64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -95,19 +117,71 @@ impl Default for Config {
             hotkey: "rightalt".into(),
             stream: true,
             // Prefer accuracy: wait for a real pause; avoid mid-sentence force-cuts.
-            stream_min_silence_ms: 550,
+            stream_min_silence_ms: 600,
+            // Longer force-cut: 6s mid-sentence cuts raised CER on continuous speech.
             stream_max_segment_ms: 12_000,
-            stream_min_speech_ms: 320,
+            stream_min_speech_ms: 280,
             dual_model: true,
+            // Paraformer streaming is accurate enough to re-enable live preedit.
+            dual_preedit: true,
             stream_model_dir: crate::local_stream::default_model_dir()
                 .to_string_lossy()
                 .into_owned(),
-            stream_threads: 2,
+            // Paraformer benefits from a few more threads than tiny Zipformer.
+            stream_threads: 3,
+            near_field: true,
+            vad_speech_rms: 0.0,
+            vad_snr: 0.0,
+            agc_max_gain: 0.0,
         }
     }
 }
 
 impl Config {
+    /// Effective VAD absolute RMS gate.
+    pub fn effective_vad_speech_rms(&self) -> f64 {
+        if self.vad_speech_rms > 0.0 {
+            self.vad_speech_rms
+        } else if self.near_field {
+            // Mild: still above room murmur, not so high that soft speech is chopped.
+            520.0
+        } else {
+            320.0
+        }
+    }
+
+    /// Effective speech-to-noise ratio gate (1.0 = disabled).
+    pub fn effective_vad_snr(&self) -> f64 {
+        if self.vad_snr > 0.0 {
+            self.vad_snr
+        } else if self.near_field {
+            2.4
+        } else {
+            1.6
+        }
+    }
+
+    /// Effective AGC max gain.
+    pub fn effective_agc_max_gain(&self) -> f64 {
+        if self.agc_max_gain > 0.0 {
+            self.agc_max_gain.clamp(1.0, 32.0)
+        } else if self.near_field {
+            // Enough for quiet headsets; not 32× (that lifted bystanders).
+            6.0
+        } else {
+            12.0
+        }
+    }
+
+    /// Min peak (s16) for a committed phrase after AGC.
+    pub fn effective_min_segment_peak(&self) -> i32 {
+        if self.near_field {
+            900
+        } else {
+            350
+        }
+    }
+
     pub fn config_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))

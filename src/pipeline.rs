@@ -70,7 +70,8 @@ pub async fn transcribe_pcm(cfg: &Config, sample_rate: u32, pcm: &[u8]) -> Resul
         bail!("segment too short");
     }
     let (peak, _) = wav::pcm16_levels(pcm);
-    if peak < 300 {
+    // After stream AGC, true silence stays very low; quiet speech is boosted.
+    if peak < 120 {
         bail!("segment silent");
     }
     let prepared = wav::pcm16_prepare_for_asr(pcm, sample_rate);
@@ -99,9 +100,11 @@ pub fn pcm_to_temp_wav(sample_rate: u32, pcm: &[u8]) -> Result<PathBuf> {
         );
     }
     let (peak, rms) = wav::pcm16_levels(pcm);
-    if peak < 300 {
+    if peak < 120 {
+        let src = default_source_hint();
         bail!(
-            "麦克风几乎无声 (peak={peak}) — 检查是否静音/选错输入设备"
+            "麦克风几乎无信号 (peak={peak}, rms={rms:.0}){src}。\
+             请检查：系统设置→声音→输入设备是否选对、是否静音；USB 麦可换内置麦试一下"
         );
     }
 
@@ -136,6 +139,32 @@ pub fn pcm_to_temp_wav(sample_rate: u32, pcm: &[u8]) -> Result<PathBuf> {
     Ok(tmp)
 }
 
+/// Best-effort name of the current default capture device (for error messages).
+fn default_source_hint() -> String {
+    let try_cmd = |prog: &str, args: &[&str]| -> Option<String> {
+        let o = std::process::Command::new(prog)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    };
+    // pactl: alsa_input....
+    if let Some(name) = try_cmd("pactl", &["get-default-source"]) {
+        return format!("，当前输入={name}");
+    }
+    String::new()
+}
+
 /// Ordered dual-model events: chunks always precede any segment they produce.
 #[derive(Debug)]
 pub enum DualEvent {
@@ -157,21 +186,43 @@ pub struct LiveCapture {
     dual_rx: Option<mpsc::UnboundedReceiver<DualEvent>>,
 }
 
+/// Optional capture tuning (near-field gates + AGC).
+#[derive(Debug, Clone)]
+pub struct CaptureTune {
+    pub agc_max_gain: f64,
+    /// Only forward dual-model preedit chunks at/above this RMS (0 = always).
+    pub preedit_min_rms: f64,
+}
+
+impl Default for CaptureTune {
+    fn default() -> Self {
+        Self {
+            agc_max_gain: 4.0,
+            preedit_min_rms: 700.0,
+        }
+    }
+}
+
 impl LiveCapture {
     pub fn start(sample_rate: u32) -> Result<Self> {
-        Self::start_inner(sample_rate, None, false)
+        Self::start_inner(sample_rate, None, false, CaptureTune::default())
     }
 
-    pub fn start_streaming(sample_rate: u32, vad: VadConfig) -> Result<Self> {
-        Self::start_inner(sample_rate, Some(vad), false)
+    pub fn start_streaming(sample_rate: u32, vad: VadConfig, tune: CaptureTune) -> Result<Self> {
+        Self::start_inner(sample_rate, Some(vad), false, tune)
     }
 
-    /// Dual-model: ordered Chunk/Segment events for Zipformer + Qwen3.
-    pub fn start_dual(sample_rate: u32, vad: VadConfig) -> Result<Self> {
-        Self::start_inner(sample_rate, Some(vad), true)
+    /// Dual-model: ordered Chunk/Segment events for stream preedit + Qwen3.
+    pub fn start_dual(sample_rate: u32, vad: VadConfig, tune: CaptureTune) -> Result<Self> {
+        Self::start_inner(sample_rate, Some(vad), true, tune)
     }
 
-    fn start_inner(sample_rate: u32, vad: Option<VadConfig>, dual: bool) -> Result<Self> {
+    fn start_inner(
+        sample_rate: u32,
+        vad: Option<VadConfig>,
+        dual: bool,
+        tune: CaptureTune,
+    ) -> Result<Self> {
         let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<u8>>(64);
         let handle = capture::spawn_pcm_capture(sample_rate, pcm_tx)?;
         let pcm = Arc::new(Mutex::new(Vec::new()));
@@ -195,8 +246,13 @@ impl LiveCapture {
             let mut segmenter = vad.map(Segmenter::new);
             // Carry a leftover odd byte so dual PCM is always even s16 frames.
             let mut odd_carry: Option<u8> = None;
+            // Limited AGC: enough for slightly quiet mics, not enough to lift far talkers.
+            let mut agc = wav::StreamAgc::with_max_gain(tune.agc_max_gain);
+            let _ = tune.preedit_min_rms;
 
             while let Some(mut chunk) = pcm_rx.recv().await {
+                chunk = agc.process(&chunk);
+
                 {
                     let mut g = pcm_c.lock().await;
                     g.extend_from_slice(&chunk);
@@ -217,6 +273,7 @@ impl LiveCapture {
 
                 if let Some(tx) = dual_tx.as_ref() {
                     if !chunk.is_empty() {
+                        // Continuous audio for streaming ASR (do not drop quiet frames).
                         let _ = tx.send(DualEvent::Chunk(chunk.clone()));
                     }
                 }

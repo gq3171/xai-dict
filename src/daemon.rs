@@ -36,13 +36,22 @@ impl State {
 }
 
 enum SessionCmd {
-    Toggle,
+    Toggle {
+        /// Reply with state **after** the toggle is applied (if provided).
+        reply: Option<tokio::sync::oneshot::Sender<State>>,
+    },
     Start,
     Stop,
     Status {
         reply: tokio::sync::oneshot::Sender<State>,
     },
     Quit,
+}
+
+/// ASR job result tagged with session id so late finishes cannot clobber a new session.
+struct AsrDone {
+    session: u64,
+    result: std::result::Result<String, String>,
 }
 
 struct StreamOutcome {
@@ -175,7 +184,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 match crate::local_stream::ensure_warm(&dir, thr, sr) {
                     Ok(()) => {
                         tracing::info!("zipformer warm worker preloaded");
-                        eprintln!("xai-dict: Zipformer 流式模型已常驻（预编辑实时）");
+                        eprintln!("xai-dict: 流式预编辑模型已常驻（Paraformer/Zipformer）");
                     }
                     Err(e) => tracing::warn!("zipformer preload failed: {e:#}"),
                 }
@@ -215,8 +224,10 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let mut recording: Option<RecordingSession> = None;
 
-    let (asr_done_tx, mut asr_done_rx) =
-        mpsc::unbounded_channel::<std::result::Result<String, String>>();
+    let (asr_done_tx, mut asr_done_rx) = mpsc::unbounded_channel::<AsrDone>();
+    // Monotonic id for each stop→ASR job; only the matching finish may leave Transcribing.
+    let mut asr_session: u64 = 0;
+    let mut active_asr_session: u64 = 0;
 
     let max_secs: u64 = std::env::var("XAI_DICT_MAX_SECS")
         .ok()
@@ -243,12 +254,24 @@ pub async fn run(cfg: Config) -> Result<()> {
                 auto_stop.as_mut().reset(tokio::time::Instant::now() + DISARM);
             }
             Some(()) = hk_rx.recv() => {
-                let _ = cmd_tx.send(SessionCmd::Toggle);
+                let _ = cmd_tx.send(SessionCmd::Toggle { reply: None });
             }
-            Some(result) = asr_done_rx.recv() => {
-                match result {
+            Some(done) = asr_done_rx.recv() => {
+                let mut st = state.lock().await;
+                if *st != State::Transcribing || done.session != active_asr_session {
+                    tracing::debug!(
+                        session = done.session,
+                        active = active_asr_session,
+                        state = st.as_str(),
+                        "ignoring stale ASR result"
+                    );
+                    continue;
+                }
+                *st = State::Idle;
+                drop(st);
+                match done.result {
                     Ok(text) => {
-                        tracing::info!(n = text.len(), "delivered");
+                        tracing::info!(n = text.len(), session = done.session, "delivered");
                         if text.is_empty() {
                             notify::idle("未识别到语音");
                         } else {
@@ -256,11 +279,10 @@ pub async fn run(cfg: Config) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        tracing::error!("asr: {e}");
+                        tracing::error!(session = done.session, "asr: {e}");
                         notify::error(&e);
                     }
                 }
-                *state.lock().await = State::Idle;
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -291,12 +313,14 @@ pub async fn run(cfg: Config) -> Result<()> {
                             &mut recording,
                             &mut armed,
                             &mut auto_stop,
+                            &mut asr_session,
+                            &mut active_asr_session,
                             asr_done_tx.clone(),
                             false,
                         )
                         .await;
                     }
-                    SessionCmd::Toggle => {
+                    SessionCmd::Toggle { reply } => {
                         let s = *state.lock().await;
                         match s {
                             State::Idle => {
@@ -317,14 +341,21 @@ pub async fn run(cfg: Config) -> Result<()> {
                                     &mut recording,
                                     &mut armed,
                                     &mut auto_stop,
+                                    &mut asr_session,
+                                    &mut active_asr_session,
                                     asr_done_tx.clone(),
                                     true,
                                 )
                                 .await;
                             }
                             State::Transcribing => {
-                                notify::idle("正在识别，请稍候…");
+                                // Already finishing — do not spam another toast.
+                                tracing::debug!("toggle ignored (transcribing)");
                             }
+                        }
+                        if let Some(r) = reply {
+                            let s = *state.lock().await;
+                            let _ = r.send(s);
                         }
                     }
                 }
@@ -383,7 +414,9 @@ async fn try_stop(
     recording: &mut Option<RecordingSession>,
     armed: &mut bool,
     auto_stop: &mut std::pin::Pin<&mut tokio::time::Sleep>,
-    asr_done_tx: mpsc::UnboundedSender<std::result::Result<String, String>>,
+    asr_session: &mut u64,
+    active_asr_session: &mut u64,
+    asr_done_tx: mpsc::UnboundedSender<AsrDone>,
     honor_debounce: bool,
 ) {
     let Some(sess) = recording.take() else {
@@ -402,16 +435,27 @@ async fn try_stop(
         .as_mut()
         .reset(tokio::time::Instant::now() + DISARM);
 
+    *asr_session = asr_session.wrapping_add(1);
+    let session = *asr_session;
+    *active_asr_session = session;
+
     *state.lock().await = State::Transcribing;
+    // Streaming path often finishes in <50ms (phrases already on screen).
+    // Still show "识别中" so the sticky "录音中" card is replaced immediately.
     notify::transcribing();
-    tracing::info!(elapsed_ms, streaming = sess.streaming, "recording stopped");
+    tracing::info!(
+        elapsed_ms,
+        streaming = sess.streaming,
+        session,
+        "recording stopped"
+    );
 
     let cfg = cfg.clone();
     tokio::spawn(async move {
         let result = finish_and_deliver(&cfg, sess)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = asr_done_tx.send(result);
+        let _ = asr_done_tx.send(AsrDone { session, result });
     });
 }
 
@@ -441,19 +485,40 @@ async fn start_recording(cfg: &Config) -> Result<RecordingSession> {
         && cfg.dual_model
         && crate::local_stream::model_ready(std::path::Path::new(&cfg.stream_model_dir));
 
+    // Near-field defaults: higher absolute RMS + SNR vs ambient so bystanders don't trigger.
+    let speech_rms = cfg.effective_vad_speech_rms();
+    let snr = cfg.effective_vad_snr();
+    let min_peak = cfg.effective_min_segment_peak();
     let vad = VadConfig {
         sample_rate: cfg.sample_rate,
         frame_ms: 30,
-        speech_rms: 700.0,
+        speech_rms,
         min_silence_ms: cfg.stream_min_silence_ms,
-        min_speech_ms: cfg.stream_min_speech_ms,
+        min_speech_ms: cfg.stream_min_speech_ms.max(if cfg.near_field { 300 } else { 250 }),
         max_segment_ms: cfg.stream_max_segment_ms,
+        snr_ratio: snr,
+        min_segment_peak: min_peak,
+        min_segment_rms: if cfg.near_field { 280.0 } else { 150.0 },
     };
+    let tune = pipeline::CaptureTune {
+        agc_max_gain: cfg.effective_agc_max_gain(),
+        // Always stream continuous PCM to Paraformer; VAD alone rejects bystanders.
+        preedit_min_rms: 0.0,
+    };
+    tracing::info!(
+        near_field = cfg.near_field,
+        speech_rms,
+        snr,
+        min_peak,
+        agc_max = tune.agc_max_gain,
+        preedit_min_rms = tune.preedit_min_rms,
+        "capture gates"
+    );
 
     let mut capture = if dual {
-        LiveCapture::start_dual(cfg.sample_rate, vad)?
+        LiveCapture::start_dual(cfg.sample_rate, vad, tune)?
     } else if use_stream {
-        LiveCapture::start_streaming(cfg.sample_rate, vad)?
+        LiveCapture::start_streaming(cfg.sample_rate, vad, tune)?
     } else {
         LiveCapture::start(cfg.sample_rate)?
     };
@@ -483,17 +548,21 @@ async fn start_recording(cfg: &Config) -> Result<RecordingSession> {
 }
 
 /// Dual-model live path (ordered events: Chunk then Segment for each phrase):
-/// - Zipformer: continuous partials → fcitx Preedit
-/// - Qwen3: on each VAD phrase → Commit final
+/// - Zipformer: continuous partials → fcitx Preedit (provisional, filtered)
+/// - Qwen3: on each VAD phrase → Commit final (source of truth)
 async fn dual_worker(
     cfg: Config,
     mut events: mpsc::UnboundedReceiver<DualEvent>,
 ) -> StreamOutcome {
     let mut committed = String::new();
     let mut phrases = 0u32;
+    // Latest raw Zipformer decode (may be wild); used only for short fallback.
     let mut last_partial = String::new();
-    // True after at least one VAD finalize ran this session.
-    let mut any_vad_finalize = false;
+    // What we actually pushed to fcitx preedit (stability-gated).
+    let mut shown_preedit = String::new();
+    let mut pending_preedit = String::new();
+    let mut pending_hits: u8 = 0;
+    let show_preedit = cfg.dual_preedit;
 
     let sdir = std::path::PathBuf::from(&cfg.stream_model_dir);
     let qdir = std::path::PathBuf::from(&cfg.qwen3_model_dir);
@@ -535,21 +604,37 @@ async fn dual_worker(
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}")));
                 match res {
                     Ok(partial) => {
-                        if partial.text != last_partial {
-                            last_partial = partial.text;
-                            let t = last_partial.clone();
+                        let raw = partial.text.trim().to_string();
+                        if raw == last_partial {
+                            continue;
+                        }
+                        last_partial = raw.clone();
+                        if !show_preedit {
+                            continue;
+                        }
+                        // Ignore Zipformer endpoint; VAD owns phrase cuts.
+                        if let Some(to_show) = preedit_update(
+                            &mut shown_preedit,
+                            &mut pending_preedit,
+                            &mut pending_hits,
+                            &raw,
+                        ) {
+                            let t = to_show;
                             let _ = tokio::task::spawn_blocking(move || output::set_preedit(&t))
                                 .await;
                         }
-                        // Ignore Zipformer endpoint; VAD owns phrase cuts.
                     }
                     Err(e) => tracing::debug!("zipformer feed: {e:#}"),
                 }
             }
             DualEvent::Segment(seg) => {
-                any_vad_finalize = true;
                 let secs = seg.pcm.len() as f64 / (cfg.sample_rate as f64 * 2.0);
-                tracing::info!(secs, "dual: VAD phrase → Qwen3 finalize");
+                let zip_snapshot = last_partial.clone();
+                tracing::info!(
+                    secs,
+                    zip_n = zip_snapshot.chars().count(),
+                    "dual: VAD phrase → Qwen3 finalize"
+                );
 
                 let qwen_text =
                     match pipeline::transcribe_pcm(&cfg, cfg.sample_rate, &seg.pcm).await {
@@ -560,22 +645,15 @@ async fn dual_worker(
                         }
                     };
 
-                let final_text = if !qwen_text.is_empty() {
-                    qwen_text
-                } else if last_partial.chars().count() >= 2 {
-                    tracing::info!(
-                        n = last_partial.len(),
-                        "Qwen3 empty — Zipformer partial fallback"
-                    );
-                    last_partial.clone()
-                } else {
-                    String::new()
-                };
+                let final_text = pick_dual_final(&qwen_text, &zip_snapshot, secs);
                 last_partial.clear();
+                shown_preedit.clear();
+                pending_preedit.clear();
+                pending_hits = 0;
                 let _ = tokio::task::spawn_blocking(output::clear_preedit).await;
 
                 if final_text.is_empty() {
-                    tracing::debug!("skip empty finalize");
+                    tracing::debug!("skip empty finalize (no Qwen3; Zipformer not trusted)");
                     let _ = tokio::task::spawn_blocking(crate::local_stream::start_utterance).await;
                     continue;
                 }
@@ -611,28 +689,148 @@ async fn dual_worker(
         }
     }
 
-    // Leftover preedit: only if VAD never finalized (short utterance / no silence).
-    // If VAD already committed phrases, leftover is usually contamination — clear only.
+    // Never commit raw Zipformer leftover as "final" — that was a major source of
+    // preedit/final mismatch. Short takes with no VAD phrase fall through to
+    // full-buffer Qwen3 in finish_and_deliver.
     let _ = tokio::task::spawn_blocking(output::clear_preedit).await;
-    if !last_partial.is_empty() && !any_vad_finalize {
-        let t = last_partial.clone();
-        let paste = cfg.paste;
-        let ok = tokio::task::spawn_blocking(move || output::commit_final(&t, paste))
-            .await
-            .unwrap_or(Ok(false))
-            .unwrap_or(false);
-        if ok || !last_partial.is_empty() {
-            append_phrase(&mut committed, &last_partial);
-            phrases += 1;
-            tracing::info!(n = last_partial.len(), "dual: leftover partial committed");
-        }
-    }
-
     let _ = tokio::task::spawn_blocking(crate::local_stream::finish_utterance).await;
 
     StreamOutcome {
         committed,
         phrases,
+    }
+}
+
+/// Gate Zipformer partials so fcitx preedit doesn't thrash between unrelated guesses.
+///
+/// Accept immediately when text grows/shrinks as a prefix (normal streaming).
+/// Require two identical consecutive reads before accepting a full rewrite.
+fn preedit_update(
+    shown: &mut String,
+    pending: &mut String,
+    pending_hits: &mut u8,
+    new: &str,
+) -> Option<String> {
+    let new = new.trim();
+    if new.is_empty() {
+        return None;
+    }
+    if new == shown.as_str() {
+        return None;
+    }
+    // Monotonic growth or small retraction — normal streaming decoder behavior.
+    if shown.is_empty()
+        || new.starts_with(shown.as_str())
+        || (shown.starts_with(new)
+            && shown.chars().count().saturating_sub(new.chars().count()) <= 6)
+    {
+        *shown = new.to_string();
+        pending.clear();
+        *pending_hits = 0;
+        return Some(shown.clone());
+    }
+    // High overlap rewrite (e.g. one character correction mid-phrase).
+    if char_similarity(shown, new) >= 0.65 {
+        *shown = new.to_string();
+        pending.clear();
+        *pending_hits = 0;
+        return Some(shown.clone());
+    }
+    // Drastic change: hold until Zipformer repeats the same guess twice.
+    if new == pending.as_str() {
+        *pending_hits = pending_hits.saturating_add(1);
+    } else {
+        *pending = new.to_string();
+        *pending_hits = 1;
+    }
+    if *pending_hits >= 2 {
+        *shown = new.to_string();
+        pending.clear();
+        *pending_hits = 0;
+        return Some(shown.clone());
+    }
+    None
+}
+
+/// Qwen3 is source of truth. Zipformer only fills empty finals on short phrases.
+fn pick_dual_final(qwen: &str, zip: &str, secs: f64) -> String {
+    let q = qwen.trim();
+    let z = zip.trim();
+    if !q.is_empty() {
+        if !z.is_empty() {
+            let sim = char_similarity(q, z);
+            if sim < 0.45 {
+                tracing::info!(
+                    sim = format!("{sim:.2}"),
+                    qwen = %truncate_log(q, 40),
+                    zip = %truncate_log(z, 40),
+                    "dual: preedit≠final (using Qwen3)"
+                );
+            }
+        }
+        return q.to_string();
+    }
+    // Empty Qwen: only trust Zipformer on short, dense phrases (avoids long hallucinations).
+    let zc = z.chars().count();
+    let max_chars = ((secs * 6.0).ceil() as usize).clamp(4, 28);
+    if secs <= 2.5 && zc >= 2 && zc <= max_chars {
+        tracing::info!(n = zc, secs, "dual: short Zipformer fallback (Qwen3 empty)");
+        return z.to_string();
+    }
+    if !z.is_empty() {
+        tracing::debug!(
+            n = zc,
+            secs,
+            "dual: discard Zipformer fallback (too long/noisy for empty Qwen3)"
+        );
+    }
+    String::new()
+}
+
+fn char_similarity(a: &str, b: &str) -> f64 {
+    let ac: Vec<char> = a.chars().collect();
+    let bc: Vec<char> = b.chars().collect();
+    if ac.is_empty() && bc.is_empty() {
+        return 1.0;
+    }
+    if ac.is_empty() || bc.is_empty() {
+        return 0.0;
+    }
+    // Dice on char bigrams — cheap and good enough for CJK strings.
+    let bigrams = |s: &[char]| -> std::collections::HashMap<(char, char), u32> {
+        let mut m = std::collections::HashMap::new();
+        if s.len() == 1 {
+            m.insert((s[0], '\0'), 1);
+            return m;
+        }
+        for w in s.windows(2) {
+            *m.entry((w[0], w[1])).or_insert(0) += 1;
+        }
+        m
+    };
+    let ba = bigrams(&ac);
+    let bb = bigrams(&bc);
+    let mut inter = 0u32;
+    for (k, va) in &ba {
+        if let Some(vb) = bb.get(k) {
+            inter += (*va).min(*vb);
+        }
+    }
+    let total = ba.values().sum::<u32>() + bb.values().sum::<u32>();
+    if total == 0 {
+        0.0
+    } else {
+        (2.0 * inter as f64) / total as f64
+    }
+}
+
+fn truncate_log(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max_chars).collect();
+        format!("{t}…")
     }
 }
 
@@ -765,10 +963,15 @@ async fn finish_and_deliver(cfg: &Config, sess: RecordingSession) -> Result<Stri
         }
 
         if outcome.committed.is_empty() {
-            // No phrase committed (very short / quiet) — fall back to full-buffer ASR.
-            if pcm.len() < (cfg.sample_rate as usize) * 2 / 2 {
+            // No phrase committed — fall back to full-buffer ASR (with normalize).
+            let min_half_sec = (cfg.sample_rate as usize) * 2 / 2;
+            if pcm.len() < min_half_sec {
+                bail!("录音过短 ({secs:.1}s)。说完后再按一次结束。");
+            }
+            if peak < 120 {
                 bail!(
-                    "录音太短或未识别到语音 ({secs:.1}s)。请多说几句再结束。"
+                    "麦克风几乎无信号 ({secs:.1}s, peak={peak}, rms={rms:.0})。\
+                     请到系统设置→声音确认输入设备；当前 USB 麦无声时可改用内置麦克风"
                 );
             }
             return finish_batch(cfg, &pcm, secs, peak, rms).await;
@@ -805,6 +1008,15 @@ async fn finish_batch(
     let text = text?;
 
     if text.is_empty() {
+        if secs < 1.5 {
+            bail!("录音过短 ({secs:.1}s)。说完后再按一次结束。");
+        }
+        if peak < 200 {
+            bail!(
+                "麦克风信号过弱 ({secs:.1}s, peak={peak}, rms={rms:.0})。\
+                 请检查输入设备/静音，或换内置麦克风；调试: ~/.local/share/xai-dict/last.wav"
+            );
+        }
         bail!(
             "未识别到语音 ({secs:.1}s, peak={peak}, rms={rms:.0})。\
              请靠近麦克风多说几秒；调试: ~/.local/share/xai-dict/last.wav"
@@ -829,9 +1041,18 @@ async fn handle_client(
 
     let reply = match line.as_str() {
         "TOGGLE" => {
-            let _ = cmd_tx.send(SessionCmd::Toggle);
-            let s = *state.lock().await;
-            format!("OK {}\n", s.as_str())
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = cmd_tx.send(SessionCmd::Toggle {
+                reply: Some(tx),
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
+                Ok(Ok(s)) => format!("OK {}\n", s.as_str()),
+                _ => {
+                    // Fallback: best-effort current state if toggle reply times out.
+                    let s = *state.lock().await;
+                    format!("OK {}\n", s.as_str())
+                }
+            }
         }
         "START" => {
             let _ = cmd_tx.send(SessionCmd::Start);

@@ -84,7 +84,7 @@ fn list_keyboards(want: Key) -> Vec<PathBuf> {
         all.push(path);
     }
     if !keyd.is_empty() {
-        tracing::info!(
+        tracing::debug!(
             n = keyd.len(),
             "hotkey: using keyd virtual keyboard only (avoids double events)"
         );
@@ -99,33 +99,44 @@ fn run_loop(
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut devices: Vec<Device> = Vec::new();
+    let mut watched_paths: Vec<PathBuf> = Vec::new();
     let mut last_scan = Instant::now() - Duration::from_secs(60);
     let mut last_fire = Instant::now() - Duration::from_secs(10);
+    let mut logged_empty = false;
 
     while !stop.load(Ordering::Relaxed) {
         if last_scan.elapsed() > Duration::from_secs(5) || devices.is_empty() {
             last_scan = Instant::now();
-            devices.clear();
-            for path in list_keyboards(key) {
-                match Device::open(&path) {
-                    Ok(d) => {
-                        tracing::info!(
-                            path = %path.display(),
-                            name = d.name().unwrap_or("?"),
-                            "hotkey: watching"
-                        );
-                        devices.push(d);
+            let paths = list_keyboards(key);
+            // Only reopen / log when the device set actually changes.
+            if paths != watched_paths || devices.is_empty() {
+                devices.clear();
+                watched_paths = paths.clone();
+                for path in &paths {
+                    match Device::open(path) {
+                        Ok(d) => {
+                            tracing::info!(
+                                path = %path.display(),
+                                name = d.name().unwrap_or("?"),
+                                "hotkey: watching"
+                            );
+                            devices.push(d);
+                        }
+                        Err(e) => tracing::debug!(path = %path.display(), "open: {e}"),
                     }
-                    Err(e) => tracing::debug!(path = %path.display(), "open: {e}"),
                 }
-            }
-            if devices.is_empty() {
-                tracing::warn!(
-                    "hotkey: no keyboard exposes {:?} — add user to `input` group?",
-                    key
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
+                if devices.is_empty() {
+                    if !logged_empty {
+                        tracing::warn!(
+                            "hotkey: no keyboard exposes {:?} — add user to `input` group?",
+                            key
+                        );
+                        logged_empty = true;
+                    }
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                logged_empty = false;
             }
         }
 

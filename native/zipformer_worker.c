@@ -1,5 +1,10 @@
 /*
- * zipformer_worker — warm streaming Zipformer (partials for dual-model IME).
+ * stream_worker (binary still named zipformer_worker for compatibility)
+ * Warm streaming ASR for dual-model IME preedit.
+ *
+ * Supports:
+ *   - Online Zipformer transducer (encoder + decoder + joiner)
+ *   - Online Paraformer (encoder + decoder only) — preferred for Chinese char-level
  *
  * Line protocol (UTF-8):
  *   stdin:
@@ -75,11 +80,34 @@ static void feed_s16(const SherpaOnnxOnlineRecognizer *rec,
   }
 }
 
+static void drain_stdin(long nbytes) {
+  if (nbytes <= 0) {
+    return;
+  }
+  char discard[4096];
+  long left = nbytes;
+  while (left > 0) {
+    size_t want =
+        (size_t)(left > (long)sizeof(discard) ? sizeof(discard) : left);
+    size_t r = fread(discard, 1, want, stdin);
+    if (r == 0) {
+      break;
+    }
+    left -= (long)r;
+  }
+}
+
 static void usage(const char *argv0) {
   fprintf(stderr,
-          "Usage: %s --encoder= --decoder= --joiner= --tokens= "
-          "[--threads=N] [--sample-rate=16000]\n",
-          argv0);
+          "Usage:\n"
+          "  Zipformer/transducer:\n"
+          "    %s --encoder= --decoder= --joiner= --tokens= "
+          "[--threads=N] [--sample-rate=16000]\n"
+          "  Paraformer (recommended for Chinese streaming preedit):\n"
+          "    %s --encoder= --decoder= --tokens= --model-type=paraformer "
+          "[--threads=N] [--sample-rate=16000]\n"
+          "  (If --joiner is omitted, paraformer is assumed.)\n",
+          argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -87,6 +115,7 @@ int main(int argc, char **argv) {
   const char *decoder = NULL;
   const char *joiner = NULL;
   const char *tokens = NULL;
+  const char *model_type = NULL; /* "paraformer" | "transducer" | NULL=auto */
   int threads = 2;
   int sample_rate = 16000;
 
@@ -99,6 +128,8 @@ int main(int argc, char **argv) {
       joiner = argv[i] + 9;
     } else if (strncmp(argv[i], "--tokens=", 9) == 0) {
       tokens = argv[i] + 9;
+    } else if (strncmp(argv[i], "--model-type=", 13) == 0) {
+      model_type = argv[i] + 13;
     } else if (strncmp(argv[i], "--threads=", 10) == 0) {
       threads = atoi(argv[i] + 10);
     } else if (strncmp(argv[i], "--sample-rate=", 14) == 0) {
@@ -109,12 +140,31 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!encoder || !decoder || !joiner || !tokens) {
+  if (!encoder || !decoder || !tokens) {
     usage(argv[0]);
     return 1;
   }
   if (threads < 1) {
     threads = 1;
+  }
+
+  int use_paraformer = 0;
+  if (model_type && strcmp(model_type, "paraformer") == 0) {
+    use_paraformer = 1;
+  } else if (model_type && strcmp(model_type, "transducer") == 0) {
+    use_paraformer = 0;
+    if (!joiner) {
+      fprintf(stderr, "transducer requires --joiner=\n");
+      return 1;
+    }
+  } else {
+    /* Auto: no joiner → paraformer; with joiner → transducer. */
+    use_paraformer = (joiner == NULL || joiner[0] == '\0');
+  }
+
+  if (!use_paraformer && (!joiner || joiner[0] == '\0')) {
+    fprintf(stderr, "transducer requires --joiner=\n");
+    return 1;
   }
 
   setvbuf(stdout, NULL, _IOLBF, 0);
@@ -128,24 +178,34 @@ int main(int argc, char **argv) {
   config.model_config.num_threads = threads;
   config.model_config.provider = "cpu";
   config.model_config.debug = 0;
-  config.model_config.transducer.encoder = encoder;
-  config.model_config.transducer.decoder = decoder;
-  config.model_config.transducer.joiner = joiner;
+  if (use_paraformer) {
+    config.model_config.paraformer.encoder = encoder;
+    config.model_config.paraformer.decoder = decoder;
+    config.model_config.model_type = "paraformer";
+  } else {
+    config.model_config.transducer.encoder = encoder;
+    config.model_config.transducer.decoder = decoder;
+    config.model_config.transducer.joiner = joiner;
+    config.model_config.model_type = "zipformer";
+  }
   config.decoding_method = "greedy_search";
   config.max_active_paths = 4;
+  /* Dual-model: VAD owns phrase cuts; keep endpoint rules loose. */
   config.enable_endpoint = 1;
   config.rule1_min_trailing_silence = 2.4f;
   config.rule2_min_trailing_silence = 1.2f;
   config.rule3_min_utterance_length = 20.0f;
 
-  fprintf(stderr, "zipformer_worker: loading…\n");
+  fprintf(stderr, "stream_worker: loading %s…\n",
+          use_paraformer ? "paraformer" : "transducer/zipformer");
   const SherpaOnnxOnlineRecognizer *rec =
       SherpaOnnxCreateOnlineRecognizer(&config);
   if (!rec) {
     printf("ERR create online recognizer failed\n");
     return 2;
   }
-  fprintf(stderr, "zipformer_worker: READY\n");
+  fprintf(stderr, "stream_worker: READY (%s)\n",
+          use_paraformer ? "paraformer" : "transducer");
   printf("READY\n");
   fflush(stdout);
 
@@ -194,22 +254,11 @@ int main(int argc, char **argv) {
     }
     if (strncmp(line, "PCM ", 4) == 0) {
       long nbytes = strtol(line + 4, NULL, 10);
-      /* Always consume the declared binary payload so the protocol stays aligned. */
       int bad = (nbytes <= 0 || nbytes > 16 * 1024 * 1024 || (nbytes % 2) != 0);
 
       if (bad) {
         if (nbytes > 0 && nbytes <= 16 * 1024 * 1024) {
-          /* Discard declared payload even when size is odd/invalid. */
-          char discard[4096];
-          long left = nbytes;
-          while (left > 0) {
-            size_t want = (size_t)(left > (long)sizeof(discard) ? sizeof(discard) : left);
-            size_t r = fread(discard, 1, want, stdin);
-            if (r == 0) {
-              break;
-            }
-            left -= (long)r;
-          }
+          drain_stdin(nbytes);
         }
         printf("ERR bad PCM size\n");
         fflush(stdout);
@@ -220,17 +269,7 @@ int main(int argc, char **argv) {
       }
       unsigned char *buf = (unsigned char *)malloc((size_t)nbytes);
       if (!buf) {
-        /* Still drain stdin payload. */
-        char discard[4096];
-        long left = nbytes;
-        while (left > 0) {
-          size_t want = (size_t)(left > (long)sizeof(discard) ? sizeof(discard) : left);
-          size_t r = fread(discard, 1, want, stdin);
-          if (r == 0) {
-            break;
-          }
-          left -= (long)r;
-        }
+        drain_stdin(nbytes);
         printf("ERR oom\n");
         fflush(stdout);
         continue;
@@ -253,8 +292,7 @@ int main(int argc, char **argv) {
       feed_s16(rec, stream, sample_rate, (const int16_t *)buf, nsamp);
       free(buf);
 
-      /* Dual-model: VAD owns phrase cuts. Do not auto-reset on Zipformer endpoint
-       * (would desync from Qwen3 finalize). Just report partial text. */
+      /* VAD owns phrase cuts — report partial only, do not auto-reset. */
       emit_partial(rec, stream, 0);
       continue;
     }

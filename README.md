@@ -4,13 +4,13 @@ Linux 语音听写（LazyTyper 风格）：**全局快捷键 → 说话 → 文�
 
 默认引擎：**双模型**
 
-- **Zipformer 流式**（常驻）：边说边出预编辑（接近字级）  
+- **Paraformer 流式**（常驻，可回退 Zipformer）：边说边出预编辑（接近字级）  
 - **Qwen3-ASR**（常驻）：停顿后定稿上屏（更准）
 
 ```
 ┌─────────────────────────────────────────────┐
 │  热键 → xai-dict daemon                     │
-│    mic ─┬→ Zipformer  → fcitx Preedit       │
+│    mic ─┬→ Paraformer → fcitx Preedit       │
 │         └→ VAD 切句 → Qwen3 → Commit 定稿   │
 └─────────────────────────────────────────────┘
 ```

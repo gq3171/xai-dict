@@ -53,18 +53,13 @@ pub fn pcm16_levels(pcm: &[u8]) -> (i32, f64) {
     (peak, rms)
 }
 
-/// Soft peak normalize toward ~50% full-scale. Helps quiet mics and hard clipping.
-pub fn pcm16_normalize(pcm: &[u8]) -> Vec<u8> {
-    let (peak, _) = pcm16_levels(pcm);
-    if peak < 200 {
-        // essentially silence — leave as-is
+/// Apply a linear gain to mono s16le PCM (clamped).
+pub fn pcm16_apply_gain(pcm: &[u8], gain: f64) -> Vec<u8> {
+    if pcm.len() < 2 || (gain - 1.0).abs() < 0.02 {
         return pcm.to_vec();
     }
-    let target = 16_000.0_f64; // ~50% of 32767
-    let gain = (target / peak as f64).clamp(0.15, 8.0);
-    if (gain - 1.0).abs() < 0.08 {
-        return pcm.to_vec();
-    }
+    // Allow attenuation below 1.0 for hot/clipping mics.
+    let gain = gain.clamp(0.05, 64.0);
     let n = pcm.len() / 2;
     let mut out = Vec::with_capacity(n * 2);
     for i in 0..n {
@@ -73,6 +68,93 @@ pub fn pcm16_normalize(pcm: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out
+}
+
+/// Soft peak normalize toward ~50% full-scale. Helps quiet mics and hard clipping.
+///
+/// Quiet-but-alive mics (peak 80–2000) get strong boost; near-silence (<80) is left alone
+/// so we don't invent speech from electrical noise.
+pub fn pcm16_normalize(pcm: &[u8]) -> Vec<u8> {
+    let (peak, _) = pcm16_levels(pcm);
+    if peak < 80 {
+        // essentially silence — leave as-is (caller may still try ASR after stream AGC)
+        return pcm.to_vec();
+    }
+    let target = 16_000.0_f64; // ~50% of 32767
+    // Up to ~40× for very quiet headset mics (peak ~400 → ~16k).
+    let gain = (target / peak as f64).clamp(0.15, 40.0);
+    if (gain - 1.0).abs() < 0.08 {
+        return pcm.to_vec();
+    }
+    pcm16_apply_gain(pcm, gain)
+}
+
+/// Streaming AGC so VAD / Zipformer see usable levels on quiet USB mics.
+///
+/// Tracks a short peak EMA and slowly raises gain toward `target_peak`.
+/// Fast release when the signal is already loud (avoids clipping laptop mics).
+#[derive(Debug, Clone)]
+pub struct StreamAgc {
+    peak_ema: f64,
+    gain: f64,
+    target_peak: f64,
+    max_gain: f64,
+    /// Chunks seen (for logging once).
+    chunks: u32,
+}
+
+impl Default for StreamAgc {
+    fn default() -> Self {
+        Self::with_max_gain(4.0)
+    }
+}
+
+impl StreamAgc {
+    pub fn with_max_gain(max_gain: f64) -> Self {
+        Self {
+            peak_ema: 0.0,
+            gain: 1.0,
+            // Aim below full-scale; many laptop mics already clip at 32767.
+            target_peak: 12_000.0,
+            max_gain: max_gain.clamp(1.0, 32.0),
+            chunks: 0,
+        }
+    }
+
+    pub fn process(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let (peak, _) = pcm16_levels(chunk);
+        self.chunks = self.chunks.saturating_add(1);
+        if peak > 0 {
+            let p = peak as f64;
+            self.peak_ema = if self.peak_ema <= 1.0 {
+                p
+            } else {
+                0.85 * self.peak_ema + 0.15 * p
+            };
+            // Hot mic: actively attenuate so ASR is not fed hard-clipped PCM.
+            let desired = if self.peak_ema > 28_000.0 {
+                (12_000.0 / self.peak_ema).clamp(0.15, 1.0)
+            } else {
+                (self.target_peak / self.peak_ema.max(1.0)).clamp(1.0, self.max_gain)
+            };
+            if desired < self.gain {
+                self.gain = desired; // fast release / attenuation
+            } else {
+                self.gain = 0.9 * self.gain + 0.1 * desired;
+            }
+            if self.chunks == 8
+                || (self.chunks % 50 == 0 && ((self.gain - 1.0).abs() > 0.15 || peak > 30000))
+            {
+                tracing::info!(
+                    peak_chunk = peak,
+                    peak_ema = format!("{:.0}", self.peak_ema),
+                    gain = format!("{:.2}", self.gain),
+                    "mic AGC"
+                );
+            }
+        }
+        pcm16_apply_gain(chunk, self.gain)
+    }
 }
 
 /// First-order high-pass (~120 Hz @ 16 kHz) to cut AC hum / mic bias.

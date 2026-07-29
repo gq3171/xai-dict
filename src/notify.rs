@@ -1,4 +1,4 @@
-//! Status UI: Lazy-style OSD bar for dictation; brief notify only for boot.
+//! Status UI facade for the daemon (Plasma OSD + replaceable notifications).
 
 use crate::osd;
 
@@ -18,8 +18,10 @@ pub fn error(msg: &str) {
     osd::error(msg);
 }
 
+/// Clear sticky status and optionally show a short idle toast.
 pub fn idle(msg: &str) {
-    // Don't leave a bar at idle — short toast once (daemon start).
     osd::hide();
-    osd::boot_hint(msg);
+    if !msg.is_empty() {
+        osd::boot_hint(msg);
+    }
 }

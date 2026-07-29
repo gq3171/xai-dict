@@ -65,13 +65,22 @@ journalctl --user -u xai-dict -f
 | `xai-dict start` / `stop` | 显式开始/结束 |
 | `xai-dict status` / `quit` | 状态 / 退出 daemon |
 | `xai-dict install` | 装 systemd 服务 + desktop |
+| `xai-dict config` / `config gui` | **图形设置界面** |
+| `xai-dict config show` / `set` / `edit` | 查看 / 改键 / 编辑器打开 |
 | `xai-dict` / `dict` | 一次性终端听写（Enter 结束） |
 | `xai-dict --provider local` | 改用 Whisper |
 | `xai-dict --provider xai` | 云端 xAI STT |
 
 ## 配置
 
-`~/.config/xai-dict/config.toml`
+图形界面（推荐）：
+
+```bash
+xai-dict config          # 或: xai-dict config gui
+# 应用菜单 →「xai-dict 设置」
+```
+
+也可直接编辑 `~/.config/xai-dict/config.toml`
 
 ```toml
 provider = "qwen3"   # qwen3 | local | xai

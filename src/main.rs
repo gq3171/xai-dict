@@ -11,6 +11,7 @@ mod output;
 mod pipeline;
 mod proxy;
 mod local_stream;
+mod settings;
 mod stream_vad;
 mod stt;
 mod stt_rest;
@@ -113,8 +114,30 @@ enum Commands {
     },
     /// Write / refresh default config
     InitConfig,
+    /// Show / edit configuration (GUI by default)
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigCmd>,
+    },
     /// Show auth / model / daemon status
     Whoami,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCmd {
+    /// Open the graphical settings window (default)
+    Gui,
+    /// Print current config (path + TOML)
+    Show,
+    /// Print config file path
+    Path,
+    /// Open config.toml in a text editor
+    Edit,
+    /// Set one key: xai-dict config set dual_preedit false
+    Set {
+        key: String,
+        value: String,
+    },
 }
 
 #[tokio::main]
@@ -158,6 +181,19 @@ async fn main() -> Result<()> {
             println!("wrote {}", Config::config_path().display());
             Ok(())
         }
+        Commands::Config { action } => match action.unwrap_or(ConfigCmd::Gui) {
+            ConfigCmd::Gui => settings::run_gui(),
+            ConfigCmd::Show => {
+                settings::print_config(&cfg);
+                Ok(())
+            }
+            ConfigCmd::Path => {
+                println!("{}", Config::config_path().display());
+                Ok(())
+            }
+            ConfigCmd::Edit => settings::open_editor(&Config::config_path()),
+            ConfigCmd::Set { key, value } => settings::set_key(&key, &value),
+        },
         Commands::Whoami => {
             println!("provider: {:?}", cfg.provider);
             println!("config: {}", Config::config_path().display());
@@ -480,6 +516,10 @@ StartupNotify=false
     }
     println!("wrote {}", osd_py.display());
 
+    // Settings GUI script
+    let settings_py = settings::install_settings_script()?;
+    println!("wrote {}", settings_py.display());
+
     let app_desktop = apps.join("xai-dict.desktop");
     std::fs::write(
         &app_desktop,
@@ -496,6 +536,25 @@ Categories=Utility;AudioVideo;
         ),
     )?;
     println!("wrote {}", app_desktop.display());
+
+    let settings_desktop = apps.join("xai-dict-settings.desktop");
+    std::fs::write(
+        &settings_desktop,
+        format!(
+            r#"[Desktop Entry]
+Name=xai-dict 设置
+Name[en]=xai-dict Settings
+Comment=Configure voice dictation (models, hotkey, near-field, streaming)
+Exec={bin_s} config gui
+Icon=preferences-desktop-multimedia
+Terminal=false
+Type=Application
+Categories=Settings;Utility;AudioVideo;
+StartupNotify=true
+"#
+        ),
+    )?;
+    println!("wrote {}", settings_desktop.display());
 
     // Update desktop database if available
     let _ = std::process::Command::new("update-desktop-database")

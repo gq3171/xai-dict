@@ -335,6 +335,7 @@ fn spawn_worker(model_dir: &Path, threads: u32, sample_rate: u32) -> Result<Stre
             cmd.arg("--model-type=transducer");
         }
     }
+    apply_worker_lib_path(&mut cmd, &bin);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -395,6 +396,20 @@ fn spawn_worker(model_dir: &Path, threads: u32, sample_rate: u32) -> Result<Stre
 }
 
 fn find_worker_bin() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XAI_DICT_LIBDIR") {
+        let p = PathBuf::from(dir).join("zipformer_worker");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for p in [
+        PathBuf::from("/usr/lib/xai-dict/zipformer_worker"),
+        PathBuf::from("/usr/libexec/xai-dict/zipformer_worker"),
+    ] {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     if let Some(p) = option_env!("ZIPFORMER_WORKER_PATH") {
         let p = PathBuf::from(p);
         if p.is_file() {
@@ -407,14 +422,6 @@ fn find_worker_bin() -> Option<PathBuf> {
             if p.is_file() {
                 return Some(p);
             }
-        }
-    }
-    for p in [
-        PathBuf::from("/usr/lib/xai-dict/zipformer_worker"),
-        PathBuf::from("/usr/libexec/xai-dict/zipformer_worker"),
-    ] {
-        if p.is_file() {
-            return Some(p);
         }
     }
     if let Some(data) = dirs::data_local_dir() {
@@ -430,6 +437,26 @@ fn find_worker_bin() -> Option<PathBuf> {
         }
     }
     which_bin("zipformer_worker")
+}
+
+fn apply_worker_lib_path(cmd: &mut Command, bin: &Path) {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(d) = std::env::var("XAI_DICT_LIBDIR") {
+        if !d.is_empty() {
+            dirs.push(d);
+        }
+    }
+    if let Some(parent) = bin.parent() {
+        dirs.push(parent.display().to_string());
+    }
+    dirs.push("/usr/lib/xai-dict".into());
+    if let Ok(prev) = std::env::var("LD_LIBRARY_PATH") {
+        if !prev.is_empty() {
+            dirs.push(prev);
+        }
+    }
+    dirs.dedup();
+    cmd.env("LD_LIBRARY_PATH", dirs.join(":"));
 }
 
 fn which_bin(name: &str) -> Option<PathBuf> {

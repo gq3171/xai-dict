@@ -24,13 +24,28 @@ Linux 语音听写（LazyTyper 风格）：**全局快捷键 → 说话 → 文�
 ```bash
 sudo dpkg -i xai-dict_*_amd64.deb
 # 若缺依赖：sudo apt -f install
-xai-dict config          # 图形界面下载模型
-xai-dict install         # systemd 用户服务 + 桌面项
-# 可选：fcitx5 Module（与拼音并存，Super+V / F9）
-xai-dict install --fcitx
-systemctl --user daemon-reload
-systemctl --user enable --now xai-dict
 ```
+
+**安装后会怎样（为「别人装完能用」设计）：**
+
+| 项 | 行为 |
+|----|------|
+| 二进制 | `/usr/bin/xai-dict`，worker + 库在 `/usr/lib/xai-dict` |
+| systemd 用户单元 | `/usr/lib/systemd/user/xai-dict.service` → `ExecStart=/usr/bin/xai-dict daemon` |
+| postinst | 对 `SUDO_USER` **enable + start**；尽量把用户加入 **input** 组 |
+| 登录自启 | systemd `WantedBy=default.target` + `/etc/xdg/autostart` 调用 `xai-dict ensure` |
+| 模型 | **不在 deb 内**，需一次：`xai-dict config` 下载 |
+
+```bash
+xai-dict config                 # 必做一次：下模型 + 设热键
+systemctl --user status xai-dict
+# 若刚被加入 input 组：重新登录后全局热键才生效
+# 可选 fcitx 插件（与拼音并存 Super+V）:
+xai-dict install --fcitx
+```
+
+若服务没起来：`xai-dict ensure` 或  
+`systemctl --user enable --now xai-dict`。
 
 本地打包（开发机需已装 `sherpa-onnx` C API + `onnxruntime`）：
 
@@ -38,8 +53,6 @@ systemctl --user enable --now xai-dict
 ./packaging/build-deb.sh
 # → target/debian/xai-dict_<version>_amd64.deb
 ```
-
-**模型不进 deb**（约 2GB+），用设置界面「下载并应用」。
 
 ### 从源码（Arch 等）
 

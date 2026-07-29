@@ -3,6 +3,7 @@ mod capture;
 mod config;
 mod daemon;
 mod hotkey;
+mod install_svc;
 mod local_qwen3;
 mod local_whisper;
 mod notify;
@@ -20,7 +21,6 @@ mod wav;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::{Config, Provider};
-use std::path::PathBuf;
 use stt::{SttEvent, SttSession};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -115,6 +115,12 @@ enum Commands {
         /// Also build & install fcitx5 Module (Super+V / F9, coexists with Pinyin)
         #[arg(long, default_value_t = false)]
         fcitx: bool,
+    },
+    /// Ensure user service is enabled/started (for deb postinst / login autostart)
+    Ensure {
+        /// Do not print noise
+        #[arg(long, default_value_t = false)]
+        quiet: bool,
     },
     /// Test microphone levels for ~secs (peak / rms)
     MicTest {
@@ -257,12 +263,15 @@ async fn main() -> Result<()> {
         Commands::Stop => daemon::client_cmd("STOP").await,
         Commands::Status => daemon::client_cmd("STATUS").await,
         Commands::Quit => daemon::client_cmd("QUIT").await,
-        Commands::Install { enable, fcitx } => {
-            install_service(enable)?;
-            if fcitx {
-                install_fcitx()?;
+        Commands::Install { enable, fcitx } => install_svc::install_all(enable, fcitx),
+        Commands::Ensure { quiet } => {
+            if quiet {
+                install_svc::ensure_running_quiet()
+            } else {
+                install_svc::ensure_user_service(true)?;
+                println!("ok — bin={}", install_svc::resolve_bin()?.display());
+                Ok(())
             }
-            Ok(())
         }
         Commands::MicTest { secs, device } => {
             let dev = device
@@ -508,237 +517,6 @@ async fn wait_for_stop(max_secs: u64) {
             _ = ctrl_c => {}
         }
     }
-}
-
-fn install_fcitx() -> Result<()> {
-    // Prefer repo tree (cargo run / git checkout), else next to installed share data.
-    let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fcitx5-xaidict/install-user.sh"),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join("Projects/rust/xai-dict/fcitx5-xaidict/install-user.sh"),
-        PathBuf::from("/usr/share/xai-dict/fcitx5-xaidict/install-user.sh"),
-    ];
-    let script = candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "找不到 fcitx5-xaidict/install-user.sh\n\
-             请在源码树执行: cd fcitx5-xaidict && ./install-user.sh"
-        )
-    })?;
-    println!("running {}", script.display());
-    let status = std::process::Command::new("bash")
-        .arg(&script)
-        .status()
-        .with_context(|| format!("run {}", script.display()))?;
-    if !status.success() {
-        anyhow::bail!("fcitx install failed ({status})");
-    }
-    // Avoid double-trigger with Super+V when Right-Alt also fires.
-    let cfg = Config::load();
-    if cfg.hotkey != "none" {
-        println!(
-            "提示: fcitx 已装 Super+V/F9。若与内置热键重复，可: xai-dict config set hotkey none"
-        );
-    }
-    Ok(())
-}
-
-fn install_service(enable: bool) -> Result<()> {
-    let home = dirs::home_dir().context("HOME")?;
-    let cargo_bin = home.join(".cargo/bin/xai-dict");
-    let bin = if cargo_bin.is_file() {
-        cargo_bin
-    } else {
-        which("xai-dict")
-            .map(std::path::PathBuf::from)
-            .context("xai-dict not on PATH — run: cargo install --path .")?
-    };
-    let bin_s = bin.display().to_string();
-
-    // systemd user unit
-    let unit_dir = home.join(".config/systemd/user");
-    std::fs::create_dir_all(&unit_dir)?;
-    let unit = unit_dir.join("xai-dict.service");
-    // Note: do not use PartOf=graphical-session.target together with
-    // WantedBy=default.target in ways that fight session lifecycle.
-    // ydotoold must NOT use After=default.target or we get an ordering cycle:
-    // default → xai-dict → ydotoold → default
-    let unit_body = format!(
-        r#"[Unit]
-Description=xai-dict voice dictation daemon (Lazy-style)
-After=pipewire.service graphical-session.target ydotoold.service
-Wants=ydotoold.service
-
-[Service]
-Type=simple
-ExecStart={bin_s} daemon
-Restart=on-failure
-RestartSec=2
-Environment=RUST_LOG=info
-Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
-
-[Install]
-WantedBy=default.target
-"#
-    );
-    std::fs::write(&unit, unit_body)?;
-    println!("wrote {}", unit.display());
-
-    // Desktop entries
-    let apps = home.join(".local/share/applications");
-    std::fs::create_dir_all(&apps)?;
-
-    let toggle_desktop = apps.join("xai-dict-toggle.desktop");
-    std::fs::write(
-        &toggle_desktop,
-        format!(
-            r#"[Desktop Entry]
-Name=xai-dict Toggle
-Comment=Start/stop voice dictation (bind a global shortcut to this)
-Exec={bin_s} toggle
-Icon=audio-input-microphone
-Terminal=false
-Type=Application
-Categories=Utility;AudioVideo;
-StartupNotify=false
-"#
-        ),
-    )?;
-    println!("wrote {}", toggle_desktop.display());
-
-    // Install OSD script for Lazy-style bottom bar
-    let data = home.join(".local/share/xai-dict");
-    std::fs::create_dir_all(&data)?;
-    let osd_py = data.join("osd_bar.py");
-    std::fs::write(&osd_py, include_str!("../scripts/osd_bar.py"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&osd_py, std::fs::Permissions::from_mode(0o755));
-    }
-    println!("wrote {}", osd_py.display());
-
-    // Settings GUI script
-    let settings_py = settings::install_settings_script()?;
-    println!("wrote {}", settings_py.display());
-
-    let app_desktop = apps.join("xai-dict.desktop");
-    std::fs::write(
-        &app_desktop,
-        format!(
-            r#"[Desktop Entry]
-Name=xai-dict
-Comment=Voice dictation (Qwen3-ASR / Whisper / xAI)
-Exec={bin_s} whoami
-Icon=audio-input-microphone
-Terminal=true
-Type=Application
-Categories=Utility;AudioVideo;
-"#
-        ),
-    )?;
-    println!("wrote {}", app_desktop.display());
-
-    let settings_desktop = apps.join("xai-dict-settings.desktop");
-    std::fs::write(
-        &settings_desktop,
-        format!(
-            r#"[Desktop Entry]
-Name=xai-dict 设置
-Name[en]=xai-dict Settings
-Comment=Configure voice dictation (models, hotkey, near-field, streaming)
-Exec={bin_s} config gui
-Icon=preferences-desktop-multimedia
-Terminal=false
-Type=Application
-Categories=Settings;Utility;AudioVideo;
-StartupNotify=true
-"#
-        ),
-    )?;
-    println!("wrote {}", settings_desktop.display());
-
-    // Update desktop database if available
-    let _ = std::process::Command::new("update-desktop-database")
-        .arg(&apps)
-        .status();
-
-    if enable {
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status();
-        let status = std::process::Command::new("systemctl")
-            .args(["--user", "enable", "--now", "xai-dict.service"])
-            .status()
-            .context("systemctl enable")?;
-        if status.success() {
-            println!("enabled & started: systemctl --user status xai-dict");
-        } else {
-            eprintln!("systemctl enable failed — start manually: xai-dict daemon");
-        }
-    }
-
-    // Ensure config has hotkey = rightalt
-    let mut cfg = Config::load();
-    if cfg.hotkey.is_empty() {
-        cfg.hotkey = "rightalt".into();
-        let _ = cfg.save();
-    }
-
-    // Ensure ydotool daemon for Wayland text inject.
-    // Never use After=default.target here — with xai-dict After=ydotoold + both
-    // WantedBy=default.target, systemd detects an ordering cycle and drops xai-dict.
-    let ydotool_unit = home.join(".config/systemd/user/ydotoold.service");
-    if let Some(parent) = ydotool_unit.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(
-        &ydotool_unit,
-        r#"[Unit]
-Description=ydotool daemon (uinput keyboard automation for xai-dict)
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket --socket-perm=0600
-Restart=on-failure
-RestartSec=1
-
-[Install]
-WantedBy=default.target
-"#,
-    );
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "--now", "ydotoold.service"])
-        .status();
-    println!("wrote & ensured {}", ydotool_unit.display());
-
-    println!(
-        r#"
-=== 全局热键（已内置）===
-  右 Alt 点按 → 开始/结束录音（toggle）
-  或设 hotkey_mode = "ptt" → 按住说话、松手定稿
-  识别结果优先经 fcitx Commit 上屏，否则 clipboard / ydotool
-
-配置: ~/.config/xai-dict/config.toml
-  hotkey = "rightalt"
-  hotkey_mode = "toggle"   # 或 "ptt"
-  paste = true
-
-fcitx5 插件（与拼音并存）:
-  xai-dict install --fcitx
-  # Super+V / F9 开关听写
-
-调试:
-  xai-dict status
-  xai-dict mic-test
-  journalctl --user -u xai-dict -f
-  systemctl --user status ydotoold
-"#
-    );
-    Ok(())
 }
 
 fn which(name: &str) -> Option<String> {

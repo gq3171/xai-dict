@@ -208,6 +208,7 @@ fn spawn_worker(
     if !hotwords.is_empty() {
         cmd.arg(format!("--hotwords={hotwords}"));
     }
+    apply_worker_lib_path(&mut cmd, &bin);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -286,7 +287,23 @@ fn spawn_worker(
 }
 
 fn find_worker_bin() -> Option<PathBuf> {
-    // 1) Built by build.rs this compile
+    // 0) Explicit env (packaged systemd sets XAI_DICT_LIBDIR)
+    if let Ok(dir) = std::env::var("XAI_DICT_LIBDIR") {
+        let p = PathBuf::from(dir).join("qwen3_worker");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // 1) Debian/system package layout first (reliable after dpkg -i)
+    for p in [
+        PathBuf::from("/usr/lib/xai-dict/qwen3_worker"),
+        PathBuf::from("/usr/libexec/xai-dict/qwen3_worker"),
+    ] {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // 2) Built by build.rs this compile (dev trees)
     for key in [
         option_env!("QWEN3_WORKER_PATH"),
         option_env!("Qwen3_WORKER_PATH"),
@@ -299,22 +316,13 @@ fn find_worker_bin() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // 2) Next to running binary / cargo target
+    // 3) Next to running binary / cargo target
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("qwen3_worker");
             if p.is_file() {
                 return Some(p);
             }
-        }
-    }
-    // 3) Debian/system package layout
-    for p in [
-        PathBuf::from("/usr/lib/xai-dict/qwen3_worker"),
-        PathBuf::from("/usr/libexec/xai-dict/qwen3_worker"),
-    ] {
-        if p.is_file() {
-            return Some(p);
         }
     }
     // 4) User data
@@ -333,6 +341,27 @@ fn find_worker_bin() -> Option<PathBuf> {
     }
     // 6) PATH
     which_bin("qwen3_worker")
+}
+
+/// So packaged workers find bundled .so next to them (and $ORIGIN rpath).
+fn apply_worker_lib_path(cmd: &mut Command, bin: &Path) {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(d) = std::env::var("XAI_DICT_LIBDIR") {
+        if !d.is_empty() {
+            dirs.push(d);
+        }
+    }
+    if let Some(parent) = bin.parent() {
+        dirs.push(parent.display().to_string());
+    }
+    dirs.push("/usr/lib/xai-dict".into());
+    if let Ok(prev) = std::env::var("LD_LIBRARY_PATH") {
+        if !prev.is_empty() {
+            dirs.push(prev);
+        }
+    }
+    dirs.dedup();
+    cmd.env("LD_LIBRARY_PATH", dirs.join(":"));
 }
 
 fn which_bin(name: &str) -> Option<PathBuf> {

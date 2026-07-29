@@ -124,13 +124,21 @@ local_threads = 6
 ### fcitx5 输入法插件（真正的 IM）
 
 ```bash
-cd fcitx5-xaidict && ./install-user.sh
+cd fcitx5-xaidict && ./install-user.sh   # 编译安装并加入 Default 组
+# 若已安装只需加入切换列表：
+./enable-im.sh
 ```
 
-1. **系统设置 → 键盘 → 虚拟键盘** 添加 **「语音听写」**
-2. 切换到该输入法后：**Super+V** 或 **F9** 开始/结束听写  
-3. 右 Alt 仍可由 daemon 全局热键使用；若重复触发，设 `hotkey = "none"`  
-4. daemon 通过 DBus `/xaidict` 做 Preedit/Commit（与插件一体）
+**不要**在 KDE「系统设置 → 虚拟键盘」里找——那里经常列不全 fcitx 自建输入法。
+
+| 步骤 | 操作 |
+|------|------|
+| 配置 | 托盘键盘图标 → 配置，或运行 `fcitx5-configtool` |
+| 切换 | **Ctrl+Space** 循环到 🎤 / xai-dict |
+| 听写 | **Super+V** 或 **F9** 开始/结束 |
+| 命令切换 | `busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 SetCurrentIM s xai-dict` |
+
+右 Alt 全局热键与 IM 内右 Alt 可能重复；建议 `hotkey = "none"` 或只用 Super+V。
 
 ## License
 

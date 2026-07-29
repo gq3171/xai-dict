@@ -43,9 +43,17 @@ else
   echo "      log: /tmp/fcitx5-xaidict.log"
 fi
 
+# Plasma 「虚拟键盘」里经常搜不到 fcitx 自建 IM — 直接写入 Default 组
+if [[ -x "$ROOT/enable-im.sh" ]]; then
+  bash "$ROOT/enable-im.sh" || true
+fi
+
 echo
-echo "=== 使用 ==="
-echo "1. 系统设置 → 键盘 → 虚拟键盘 / 输入法 → 添加 →「语音听写」"
-echo "2. systemctl --user status xai-dict   # daemon 需运行"
-echo "3. 切换到该输入法后：Super+V 或 F9 开始/结束"
-echo "4. 避免与 daemon 右 Alt 双触发：hotkey=none 或只用 Super+V"
+echo "=== 使用（不要去 Plasma「虚拟键盘」里找）==="
+echo "1. 打开配置:  fcitx5-configtool"
+echo "   或托盘键盘图标 → 配置"
+echo "2. 当前列表应含「语音听写 / Voice Dictation / xai-dict」"
+echo "3. 切换: Ctrl+Space 循环，直到托盘显示 🎤"
+echo "   或: busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 SetCurrentIM s xai-dict"
+echo "4. Super+V 或 F9 开始/结束（需 xai-dict daemon 运行）"
+echo "5. 避免与右 Alt 双触发: hotkey = \"none\""

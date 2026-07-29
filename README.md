@@ -82,7 +82,8 @@ xai-dict install --fcitx   # 可选
 | fcitx5 Module | **Super+V** / **F9**（与拼音并存） |
 | 系统快捷键 | 绑 `xai-dict toggle` |
 
-若右 Alt 与 Super+V 重复触发：`hotkey = "none"`，只用 fcitx 热键。
+fcitx 插件**不会**抢占右 Alt / AltGr（避免破坏符号输入、也避免与 daemon 双触发）。  
+关闭 daemon 热键：`hotkey = "none"`，只保留 Super+V / F9。
 
 ```bash
 xai-dict status     # idle / recording / transcribing
@@ -178,7 +179,7 @@ xai-dict install --fcitx
 | 输入法 | 保持 **拼音**（或键盘）即可 |
 | 听写热键 | **Super+V** 或 **F9** |
 | 上屏 | daemon → fcitx `Commit` / `Preedit` |
-| 也可用 | daemon 右 Alt（`hotkey`）；重复则 `hotkey = "none"` |
+| 也可用 | daemon 全局热键（默认右 Alt，需 `input` 组） |
 
 ## License
 

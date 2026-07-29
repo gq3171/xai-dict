@@ -8,6 +8,7 @@ use std::process::Command;
 pub const SYSTEM_BIN: &str = "/usr/bin/xai-dict";
 pub const SYSTEM_UNIT: &str = "/usr/lib/systemd/user/xai-dict.service";
 pub const SYSTEM_LIBDIR: &str = "/usr/lib/xai-dict";
+#[allow(dead_code)]
 pub const SYSTEM_SHARE: &str = "/usr/share/xai-dict";
 
 /// Resolve which `xai-dict` binary end users should run under systemd.
@@ -54,6 +55,7 @@ pub fn system_package_installed() -> bool {
 }
 
 /// User unit that would shadow the packaged unit.
+#[allow(dead_code)]
 pub fn user_unit_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".config/systemd/user/xai-dict.service"))
 }
@@ -394,12 +396,39 @@ fn install_fcitx() -> Result<()> {
 
 /// Called from autostart / postinst helper: enable+start if not running.
 pub fn ensure_running_quiet() -> Result<()> {
-    // If already responding, done.
-    if crate::daemon::socket_path().exists() {
-        return Ok(());
+    let sock = crate::daemon::socket_path();
+    if sock.exists() {
+        if probe_daemon_alive(&sock) {
+            return Ok(());
+        }
+        // Stale socket after crash — clear so systemd / bind can recover.
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(crate::daemon::pid_path());
     }
     let _ = ensure_user_service(true);
     Ok(())
+}
+
+/// Blocking PING on the control socket (no nested tokio runtime).
+fn probe_daemon_alive(sock: &Path) -> bool {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let Ok(mut stream) = UnixStream::connect(sock) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    if stream.write_all(b"PING\n").is_err() {
+        return false;
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut buf = [0u8; 64];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).contains("OK"),
+        _ => false,
+    }
 }
 
 fn which(name: &str) -> Option<String> {

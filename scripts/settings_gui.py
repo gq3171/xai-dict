@@ -481,7 +481,8 @@ def load_config(path: Path) -> dict:
         "sample_rate": 16000,
         "paste": True,
         "proxy": "",
-        "proxy_enabled": True,
+        # Off by default: empty proxy → env / auto-detect; avoid writing a dead 7897.
+        "proxy_enabled": False,
         "proxy_remember": "",
         "local_model": "",
         "local_threads": 6,
@@ -1199,7 +1200,7 @@ class SettingsWindow(QMainWindow):
         lay.setContentsMargins(*MARGINS)
 
         g, f = roomy_group("HTTP 代理")
-        self.proxy_on = QCheckBox("启用代理")
+        self.proxy_on = QCheckBox("启用代理（云端 xAI；留空则自动探测本机常见端口）")
         proxy_val = str(self.cfg.get("proxy", "")).strip()
         if not proxy_val:
             proxy_val = str(self.cfg.get("proxy_remember", "")).strip()
@@ -1207,15 +1208,14 @@ class SettingsWindow(QMainWindow):
             enabled = bool(self.cfg.get("proxy_enabled"))
         else:
             enabled = bool(str(self.cfg.get("proxy", "")).strip())
-        if not proxy_val:
-            proxy_val = "http://127.0.0.1:7897"
+        # Do not prefill 7897 into the value — that forced a dead proxy on first Save.
         self.proxy_on.setChecked(enabled)
         self.proxy_on.toggled.connect(self._on_proxy_toggled)
         f.addRow(self.proxy_on)
 
         self.proxy = QLineEdit(proxy_val)
         self.proxy.setMinimumHeight(34)
-        self.proxy.setPlaceholderText("http://127.0.0.1:7897")
+        self.proxy.setPlaceholderText("http://127.0.0.1:7897  （可选）")
         self.proxy.setEnabled(enabled)
         f.addRow("代理地址", self.proxy)
         f.addRow(

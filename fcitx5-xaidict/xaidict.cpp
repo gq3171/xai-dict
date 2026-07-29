@@ -228,11 +228,10 @@ bool XaiDictModule::isToggleKey(const Key &key) const {
     if (key.check(FcitxKey_F9)) {
         return true;
     }
-    // Right Alt optional — only if you set daemon hotkey=none, otherwise
-    // both may fire. Still useful as IM-side convenience.
-    if (key.check(FcitxKey_Alt_R) || key.check(FcitxKey_ISO_Level3_Shift)) {
-        return true;
-    }
+    // Do NOT intercept Right Alt / AltGr (ISO_Level3_Shift):
+    //  - breaks layouts that type symbols via AltGr
+    //  - double-fires with daemon hotkey=rightalt (toggle → start+stop)
+    // Use Super+V / F9 here; Right Alt stays on the daemon evdev path.
     return false;
 }
 

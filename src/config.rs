@@ -2,21 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     /// Local Qwen3-ASR via sherpa-onnx (default) — no network
+    #[default]
     Qwen3,
     /// Local whisper.cpp (`whisper-cli`) — no network
     Local,
     /// xAI cloud STT REST
     Xai,
-}
-
-impl Default for Provider {
-    fn default() -> Self {
-        Self::Qwen3
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,8 +29,14 @@ pub struct Config {
     pub endpointing_ms: u32,
     pub keyterms: Vec<String>,
     pub paste: bool,
-    /// HTTP proxy for cloud provider (empty = auto-detect)
+    /// HTTP proxy for cloud provider (empty = env / auto-detect local ports)
     pub proxy: String,
+    /// GUI: whether the proxy field is considered enabled (empty `proxy` when false).
+    #[serde(default)]
+    pub proxy_enabled: bool,
+    /// GUI: last non-empty proxy URL remembered while proxy is toggled off.
+    #[serde(default)]
+    pub proxy_remember: String,
     /// Path to whisper.cpp ggml model (local provider)
     pub local_model: String,
     /// Threads for local ASR (whisper / qwen3)
@@ -115,7 +116,11 @@ impl Default for Config {
             endpointing_ms: 400,
             keyterms: Vec::new(),
             paste: true,
-            proxy: "http://127.0.0.1:7897".into(),
+            // Empty: resolve_http_proxy probes env + common local ports (7897, …).
+            // Hardcoding 7897 broke cloud STT when no local proxy was running.
+            proxy: String::new(),
+            proxy_enabled: false,
+            proxy_remember: String::new(),
             local_model: model,
             local_threads: std::thread::available_parallelism()
                 .map(|n| n.get().min(8) as u32)
@@ -216,6 +221,20 @@ impl Config {
             if let Ok(file_cfg) = toml::from_str::<Config>(&raw) {
                 cfg = file_cfg;
             }
+        }
+        // Migration: older configs had only `proxy = "http://…"`. Missing
+        // `proxy_enabled` deserializes as false — do not wipe a non-empty proxy.
+        // Shape "disabled with memory" is: proxy empty + proxy_remember set.
+        if !cfg.proxy_enabled && !cfg.proxy.trim().is_empty() && cfg.proxy_remember.is_empty() {
+            cfg.proxy_enabled = true;
+        }
+        if !cfg.proxy_enabled {
+            if !cfg.proxy.is_empty() && cfg.proxy_remember.is_empty() {
+                cfg.proxy_remember = cfg.proxy.clone();
+            }
+            cfg.proxy.clear();
+        } else if cfg.proxy.is_empty() && !cfg.proxy_remember.is_empty() {
+            cfg.proxy = cfg.proxy_remember.clone();
         }
         cfg
     }

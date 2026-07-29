@@ -150,7 +150,27 @@ pub fn set_key(key: &str, value: &str) -> Result<()> {
         "input_device" => cfg.input_device = value.to_string(),
         "language" => cfg.language = value.to_string(),
         "paste" => cfg.paste = parse_bool(value)?,
-        "proxy" => cfg.proxy = value.to_string(),
+        "proxy" => {
+            cfg.proxy = value.to_string();
+            if !value.trim().is_empty() {
+                cfg.proxy_enabled = true;
+                cfg.proxy_remember = value.to_string();
+            } else {
+                cfg.proxy_enabled = false;
+            }
+        }
+        "proxy_enabled" => {
+            cfg.proxy_enabled = parse_bool(value)?;
+            if !cfg.proxy_enabled {
+                if !cfg.proxy.is_empty() {
+                    cfg.proxy_remember = cfg.proxy.clone();
+                }
+                cfg.proxy.clear();
+            } else if cfg.proxy.is_empty() && !cfg.proxy_remember.is_empty() {
+                cfg.proxy = cfg.proxy_remember.clone();
+            }
+        }
+        "proxy_remember" => cfg.proxy_remember = value.to_string(),
         "stream" => cfg.stream = parse_bool(value)?,
         "dual_model" => cfg.dual_model = parse_bool(value)?,
         "dual_preedit" => cfg.dual_preedit = parse_bool(value)?,

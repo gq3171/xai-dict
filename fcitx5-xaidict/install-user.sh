@@ -30,15 +30,8 @@ elif command -v sudo >/dev/null; then
   sudo -n rm -f /usr/share/fcitx5/inputmethod/xaidict.conf 2>/dev/null || true
 fi
 
-# Drop xai-dict from IM group (no longer an IM)
-if busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 \
-    InputMethodGroupInfo s Default &>/dev/null; then
-  busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 \
-    SetInputMethodGroupInfo ssa\(ss\) Default us 2 \
-    keyboard-us "" pinyin "" >/dev/null 2>&1 || true
-  busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 Save \
-    >/dev/null 2>&1 || true
-fi
+# Module only — do not rewrite the user's InputMethod group (would wipe Rime/etc.).
+# Old InputMethod conf files were removed above; fcitx ignores missing addons.
 
 echo "Installed module: $PREFIX/lib/fcitx5/libxaidict.so"
 echo "Restarting fcitx5…"
@@ -59,4 +52,4 @@ echo "1. 输入法保持「拼音」即可，无需切换到语音听写"
 echo "2. 任意输入框: Super+V 或 F9 → 开始/结束听写"
 echo "3. 仍可用拼音打字；听写文字由 daemon 经 fcitx Commit 上屏"
 echo "4. daemon: systemctl --user status xai-dict"
-echo "5. 右 Alt 全局热键仍可用；若重复触发设 hotkey=none，只用 Super+V"
+echo "5. 右 Alt 由 daemon 全局热键处理（需 input 组）；fcitx 侧只用 Super+V / F9"

@@ -4,7 +4,7 @@
 //! **online Zipformer transducer** (legacy). Same IPC protocol either way.
 
 use anyhow::{Context, Result, bail};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
@@ -34,6 +34,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(8);
 pub struct PartialResult {
     pub text: String,
     /// True when FINISH returned FINAL.
+    #[allow(dead_code)]
     pub is_final: bool,
 }
 
@@ -356,7 +357,7 @@ fn spawn_worker(model_dir: &Path, threads: u32, sample_rate: u32) -> Result<Stre
             .name("stream-worker-stderr".into())
             .spawn(move || {
                 let r = BufReader::new(stderr);
-                for line in r.lines().flatten() {
+                for line in r.lines().map_while(Result::ok) {
                     tracing::debug!(target: "stream_worker", "{line}");
                 }
             })
@@ -473,6 +474,3 @@ fn which_bin(name: &str) -> Option<PathBuf> {
     }
     None
 }
-
-#[allow(dead_code)]
-fn _use_read<R: Read>(_: &mut R) {}

@@ -11,8 +11,10 @@ pub struct SttResponse {
     #[serde(default)]
     pub text: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub language: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub duration: f64,
 }
 

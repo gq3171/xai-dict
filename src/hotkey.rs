@@ -72,6 +72,7 @@ pub fn parse_key(name: &str) -> Option<Key> {
 }
 
 /// Canonical config string for a key (for round-trip with settings GUI).
+#[allow(dead_code)]
 pub fn key_to_config(key: Key) -> &'static str {
     match key {
         Key::KEY_RIGHTALT => "rightalt",
@@ -141,6 +142,7 @@ pub fn key_label(key: Key) -> &'static str {
 }
 
 /// Human label for a config string (including `none`).
+#[allow(dead_code)]
 pub fn config_label(name: &str) -> String {
     match name.trim().to_ascii_lowercase().as_str() {
         "none" | "off" | "disabled" | "" => "已关闭".into(),

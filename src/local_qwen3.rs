@@ -264,7 +264,7 @@ fn spawn_worker(
             .name("qwen3-worker-stderr".into())
             .spawn(move || {
                 let reader = BufReader::new(stderr);
-                for line in reader.lines().flatten() {
+                for line in reader.lines().map_while(Result::ok) {
                     tracing::debug!(target: "qwen3_worker", "{line}");
                 }
             })

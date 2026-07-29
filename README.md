@@ -121,7 +121,16 @@ local_threads = 6
 | ASR | 内置 worker / 云 | **自有** Qwen3 / Whisper / xAI |
 | 所有权 | 闭源 worker 曾出问题 | 全开源、可改 |
 
-后续可做真正的 fcitx5 addon（按住说话 + 预编辑），当前方案已覆盖日常「任何输入框语音输入」。
+### fcitx5 输入法插件（真正的 IM）
+
+```bash
+cd fcitx5-xaidict && ./install-user.sh
+```
+
+1. **系统设置 → 键盘 → 虚拟键盘** 添加 **「语音听写」**
+2. 切换到该输入法后：**Super+V** 或 **F9** 开始/结束听写  
+3. 右 Alt 仍可由 daemon 全局热键使用；若重复触发，设 `hotkey = "none"`  
+4. daemon 通过 DBus `/xaidict` 做 Preedit/Commit（与插件一体）
 
 ## License
 

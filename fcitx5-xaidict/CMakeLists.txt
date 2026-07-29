@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(fcitx5-xaidict VERSION 0.1.0)
+project(fcitx5-xaidict VERSION 0.2.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Fcitx5Core REQUIRED)
 find_package(Fcitx5Module REQUIRED COMPONENTS DBus)
@@ -16,10 +19,8 @@ target_include_directories(xaidict PRIVATE
   /usr/include/Fcitx5/Config
 )
 set_target_properties(xaidict PROPERTIES PREFIX "lib" OUTPUT_NAME "xaidict")
-# C++17 for fcitx5
-target_compile_features(xaidict PRIVATE cxx_std_17)
 
-# Install to user-writable fcitx5 dirs by default
+# Default install to CMAKE_INSTALL_PREFIX (user: ~/.local)
 if(NOT DEFINED FCITX_INSTALL_ADDONDIR)
   set(FCITX_INSTALL_ADDONDIR "${CMAKE_INSTALL_PREFIX}/lib/fcitx5")
 endif()
@@ -29,3 +30,5 @@ endif()
 
 install(TARGETS xaidict DESTINATION "${FCITX_INSTALL_ADDONDIR}")
 install(FILES xaidict.conf DESTINATION "${FCITX_INSTALL_PKGDATADIR}/addon")
+install(FILES inputmethod/xaidict.conf
+        DESTINATION "${FCITX_INSTALL_PKGDATADIR}/inputmethod")

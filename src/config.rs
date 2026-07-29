@@ -48,6 +48,12 @@ pub struct Config {
     pub qwen3_hotwords: String,
     /// Global hotkey for daemon: `rightalt` (default), `leftalt`, or `none`
     pub hotkey: String,
+    /// How the hotkey behaves: `toggle` (press start/stop) or `ptt` (hold to talk).
+    #[serde(default = "default_hotkey_mode")]
+    pub hotkey_mode: String,
+    /// Optional mic source (PipeWire node name / Pulse source). Empty = system default.
+    #[serde(default)]
+    pub input_device: String,
     /// Commit phrases while still recording (type-as-you-speak).
     /// Uses energy VAD + per-phrase ASR. Best with local qwen3/whisper.
     pub stream: bool,
@@ -87,6 +93,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_hotkey_mode() -> String {
+    "toggle".into()
+}
+
 impl Default for Config {
     fn default() -> Self {
         let model = crate::local_whisper::default_model_path()
@@ -115,6 +125,8 @@ impl Default for Config {
             qwen3_max_new_tokens: 128,
             qwen3_hotwords: String::new(),
             hotkey: "rightalt".into(),
+            hotkey_mode: default_hotkey_mode(),
+            input_device: String::new(),
             stream: true,
             // Prefer accuracy: wait for a real pause; avoid mid-sentence force-cuts.
             stream_min_silence_ms: 600,
@@ -180,6 +192,14 @@ impl Config {
         } else {
             350
         }
+    }
+
+    /// True when hotkey is push-to-talk (hold).
+    pub fn is_ptt(&self) -> bool {
+        matches!(
+            self.hotkey_mode.trim().to_ascii_lowercase().as_str(),
+            "ptt" | "hold" | "push" | "pushtotalk" | "push-to-talk"
+        )
     }
 
     pub fn config_path() -> PathBuf {

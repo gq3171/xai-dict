@@ -55,6 +55,19 @@ pub fn ensure_warm(
     Ok(())
 }
 
+/// Force-drop and respawn the warm worker (e.g. after timeout / poison).
+pub fn recover(
+    model_dir: &Path,
+    threads: u32,
+    max_new_tokens: u32,
+    hotwords: &str,
+) -> Result<()> {
+    if let Ok(mut g) = WORKER.lock() {
+        *g = None;
+    }
+    ensure_warm(model_dir, threads, max_new_tokens, hotwords)
+}
+
 /// Transcribe a WAV; reuses the warm process when available.
 pub fn transcribe_file(
     wav: &Path,
@@ -63,16 +76,23 @@ pub fn transcribe_file(
     max_new_tokens: u32,
     hotwords: &str,
 ) -> Result<String> {
-    // Prefer warm path.
+    // Prefer warm path; on failure recover once then CLI fallback.
     match ensure_warm(model_dir, threads, max_new_tokens, hotwords)
         .and_then(|_| warm_transcribe(wav))
     {
         Ok(text) => return Ok(text),
         Err(e) => {
-            tracing::warn!(%e, "warm qwen3 failed — falling back to CLI");
-            // Drop dead worker so next call restarts clean.
-            if let Ok(mut g) = WORKER.lock() {
-                *g = None;
+            tracing::warn!(%e, "warm qwen3 failed — recovering once");
+            match recover(model_dir, threads, max_new_tokens, hotwords)
+                .and_then(|_| warm_transcribe(wav))
+            {
+                Ok(text) => return Ok(text),
+                Err(e2) => {
+                    tracing::warn!(%e2, "warm qwen3 after recover failed — CLI fallback");
+                    if let Ok(mut g) = WORKER.lock() {
+                        *g = None;
+                    }
+                }
             }
         }
     }

@@ -25,6 +25,9 @@ Linux 语音听写（LazyTyper 风格）：**全局快捷键 → 说话 → 文�
 sudo dpkg -i xai-dict_*_amd64.deb
 # 若缺依赖：sudo apt -f install
 xai-dict config          # 图形界面下载模型
+xai-dict install         # systemd 用户服务 + 桌面项
+# 可选：fcitx5 Module（与拼音并存，Super+V / F9）
+xai-dict install --fcitx
 systemctl --user daemon-reload
 systemctl --user enable --now xai-dict
 ```
@@ -48,30 +51,32 @@ sudo pacman -S sherpa-onnx wl-clipboard wtype xdotool libnotify pipewire
 
 cargo install --path .
 xai-dict install
+xai-dict install --fcitx   # 可选
 ```
 
-### 绑定快捷键（KDE）
-
-**系统设置 → 键盘 → 快捷键 → 命令（或自定义）**
-
-| 项 | 值 |
-|----|-----|
-| 命令 | `~/.cargo/bin/xai-dict toggle` |
-| 建议键 | `Meta+Alt+V` 或 `Alt_R` |
-
-### 使用
+## 使用
 
 1. 把光标放到任意输入框  
-2. **按一次**快捷键 → 提示「录音中」→ 开始说话  
-3. **边说边出字**（默认开启流式）：停顿约半秒后，该句自动上屏  
-4. **再按一次**结束；尾句也会补上  
+2. **点按模式（默认）**：按一次热键 →「录音中」→ 说话 → 再按结束  
+3. **PTT 模式**：配置 `hotkey_mode = "ptt"` → **按住**热键说话，**松手**定稿  
+4. **边说边出字**（默认流式 + 双模型）；停顿后该句 Qwen3 定稿上屏  
 
-关闭流式（改回整段结束后再上屏）：在 `~/.config/xai-dict/config.toml` 设 `stream = false`。
+热键：
+
+| 来源 | 默认 |
+|------|------|
+| daemon 内置（需 `input` 组） | 右 Alt（`hotkey`） |
+| fcitx5 Module | **Super+V** / **F9**（与拼音并存） |
+| 系统快捷键 | 绑 `xai-dict toggle` |
+
+若右 Alt 与 Super+V 重复触发：`hotkey = "none"`，只用 fcitx 热键。
 
 ```bash
 xai-dict status     # idle / recording / transcribing
 xai-dict whoami
-journalctl --user -u xai-dict -f
+xai-dict mic-test   # 3 秒电平
+xai-dict mic-list   # 输入设备列表
+journalctl --user -u xai-dict -f   # 搜 metric: 看每句延迟
 ```
 
 ## 命令一览
@@ -79,18 +84,14 @@ journalctl --user -u xai-dict -f
 | 命令 | 作用 |
 |------|------|
 | `xai-dict daemon` | 前台跑守护进程 |
-| `xai-dict toggle` | 切换录音（给快捷键用） |
-| `xai-dict start` / `stop` | 显式开始/结束 |
+| `xai-dict toggle` / `start` / `stop` | 切换 / 开始 / 结束录音 |
 | `xai-dict status` / `quit` | 状态 / 退出 daemon |
-| `xai-dict install` | 装 systemd 服务 + desktop |
-| `xai-dict config` / `config gui` | **图形设置界面** |
-| `xai-dict config show` / `set` / `edit` | 查看 / 改键 / 编辑器打开 |
-| `xai-dict` / `dict` | 一次性终端听写（Enter 结束） |
-| `xai-dict --provider local` | 改用 Whisper |
-| `xai-dict --provider xai` | 云端 xAI STT |
+| `xai-dict install [--fcitx]` | 装 systemd + desktop；可选 fcitx Module |
+| `xai-dict config` / `config gui` | **图形设置**（PTT、设备、热词、模型） |
+| `xai-dict config show` / `set` / `edit` | 查看 / 改键 / 编辑器 |
+| `xai-dict mic-test` / `mic-list` | 麦克风电平 / 设备列表 |
+| `xai-dict` / `dict` | 一次性终端听写 |
 | `./packaging/build-deb.sh` | 打 amd64 `.deb`（不含模型） |
-
-打 tag 发版会走 GitHub Actions：`git tag v0.1.0 && git push github v0.1.0`
 
 ## 配置
 
@@ -101,30 +102,60 @@ xai-dict config          # 或: xai-dict config gui
 # 应用菜单 →「xai-dict 设置」
 ```
 
-也可直接编辑 `~/.config/xai-dict/config.toml`
+也可编辑 `~/.config/xai-dict/config.toml`：
 
 ```toml
-provider = "qwen3"   # qwen3 | local | xai
+provider = "qwen3"          # qwen3 | local | xai
+hotkey = "rightalt"         # rightalt | leftalt | none
+hotkey_mode = "toggle"      # toggle | ptt
+input_device = ""            # 空=默认；见 mic-list
+stream = true
+dual_model = true
+dual_preedit = true
+near_field = true
+qwen3_hotwords = "专有名词,项目名"
 qwen3_model_dir = ".../sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
-qwen3_max_new_tokens = 512
-qwen3_hotwords = ""
+stream_model_dir = ".../sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 paste = true
 local_threads = 6
+```
+
+改配置后：`systemctl --user restart xai-dict`。
+
+### 调参提示
+
+| 现象 | 建议 |
+|------|------|
+| 旁人串音 | `near_field = true`；或调高 `vad_snr` |
+| 自己声音轻 / USB 麦 | `xai-dict mic-test`；适当增大系统输入；或 `near_field = false` |
+| 预编辑乱跳 | `dual_preedit = false` |
+| 人名术语错 | `qwen3_hotwords`（设置页可粘贴追加） |
+| 想按住说 | `hotkey_mode = "ptt"` |
+
+日志中的 `metric:` 行：`qwen_ms`（定稿耗时）、`first_preedit_ms`、`dropped`（丢句）。
+
+### 离线 CER 冒烟
+
+```bash
+python3 scripts/cer_smoke.py --ref "你好世界" --hyp "你好是界"
+# 或 TSV: 参考\\t假设  每行一条
+python3 scripts/cer_smoke.py --file samples.tsv
 ```
 
 ## 与 LazyTyper / fcitx5-vinput 的关系
 
 | | Lazy / fcitx5-vinput | xai-dict（当前） |
 |--|---------------------|------------------|
-| 触发 | fcitx5 抓键（可按住） | 全局快捷键 **点按切换** |
-| 进字 | fcitx5 `commitString` | clipboard + wtype/xdotool |
-| ASR | 内置 worker / 云 | **自有** Qwen3 / Whisper / xAI |
+| 触发 | fcitx5 抓键（可按住） | 全局热键 **toggle / PTT** + fcitx Super+V |
+| 上屏 | fcitx5 `commitString` | **优先** fcitx `Commit` / `Preedit`，否则 clipboard + wtype/ydotool |
+| ASR | 内置 worker / 云 | **自有** Qwen3 / Paraformer / Whisper / xAI |
 | 所有权 | 闭源 worker 曾出问题 | 全开源、可改 |
 
 ### fcitx5 插件（与拼音并存）
 
 ```bash
-cd fcitx5-xaidict && ./install-user.sh
+xai-dict install --fcitx
+# 或: cd fcitx5-xaidict && ./install-user.sh
 ```
 
 这是 **常驻 Module**，**不用**切换到「语音听写」输入法，**拼音照常打字**。
@@ -132,11 +163,9 @@ cd fcitx5-xaidict && ./install-user.sh
 | 操作 | 说明 |
 |------|------|
 | 输入法 | 保持 **拼音**（或键盘）即可 |
-| 听写热键 | **Super+V** 或 **F9**（全局，不抢拼音） |
+| 听写热键 | **Super+V** 或 **F9** |
 | 上屏 | daemon → fcitx `Commit` / `Preedit` |
-| 也可用 | daemon 右 Alt 全局热键（`hotkey = "rightalt"`） |
-
-若右 Alt 与插件重复触发，设 `hotkey = "none"`，只用 Super+V。
+| 也可用 | daemon 右 Alt（`hotkey`）；重复则 `hotkey = "none"` |
 
 ## License
 

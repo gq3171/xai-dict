@@ -205,26 +205,41 @@ impl Default for CaptureTune {
 
 impl LiveCapture {
     pub fn start(sample_rate: u32) -> Result<Self> {
-        Self::start_inner(sample_rate, None, false, CaptureTune::default())
+        Self::start_with_device(sample_rate, None)
     }
 
-    pub fn start_streaming(sample_rate: u32, vad: VadConfig, tune: CaptureTune) -> Result<Self> {
-        Self::start_inner(sample_rate, Some(vad), false, tune)
+    pub fn start_with_device(sample_rate: u32, device: Option<&str>) -> Result<Self> {
+        Self::start_inner(sample_rate, device, None, false, CaptureTune::default())
+    }
+
+    pub fn start_streaming(
+        sample_rate: u32,
+        device: Option<&str>,
+        vad: VadConfig,
+        tune: CaptureTune,
+    ) -> Result<Self> {
+        Self::start_inner(sample_rate, device, Some(vad), false, tune)
     }
 
     /// Dual-model: ordered Chunk/Segment events for stream preedit + Qwen3.
-    pub fn start_dual(sample_rate: u32, vad: VadConfig, tune: CaptureTune) -> Result<Self> {
-        Self::start_inner(sample_rate, Some(vad), true, tune)
+    pub fn start_dual(
+        sample_rate: u32,
+        device: Option<&str>,
+        vad: VadConfig,
+        tune: CaptureTune,
+    ) -> Result<Self> {
+        Self::start_inner(sample_rate, device, Some(vad), true, tune)
     }
 
     fn start_inner(
         sample_rate: u32,
+        device: Option<&str>,
         vad: Option<VadConfig>,
         dual: bool,
         tune: CaptureTune,
     ) -> Result<Self> {
         let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<u8>>(64);
-        let handle = capture::spawn_pcm_capture(sample_rate, pcm_tx)?;
+        let handle = capture::spawn_pcm_capture_device(sample_rate, device, pcm_tx)?;
         let pcm = Arc::new(Mutex::new(Vec::new()));
         let pcm_c = pcm.clone();
 

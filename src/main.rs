@@ -20,6 +20,7 @@ mod wav;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::{Config, Provider};
+use std::path::PathBuf;
 use stt::{SttEvent, SttSession};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -111,7 +112,21 @@ enum Commands {
         /// Also try to enable the service now
         #[arg(long, default_value_t = true)]
         enable: bool,
+        /// Also build & install fcitx5 Module (Super+V / F9, coexists with Pinyin)
+        #[arg(long, default_value_t = false)]
+        fcitx: bool,
     },
+    /// Test microphone levels for ~secs (peak / rms)
+    MicTest {
+        /// Capture duration in seconds
+        #[arg(long, default_value_t = 3.0)]
+        secs: f32,
+        /// Optional PipeWire/Pulse/ALSA device (else config `input_device`)
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// List capture sources (pactl / wpctl)
+    MicList,
     /// Write / refresh default config
     InitConfig,
     /// Show / edit configuration (GUI by default)
@@ -242,7 +257,61 @@ async fn main() -> Result<()> {
         Commands::Stop => daemon::client_cmd("STOP").await,
         Commands::Status => daemon::client_cmd("STATUS").await,
         Commands::Quit => daemon::client_cmd("QUIT").await,
-        Commands::Install { enable } => install_service(enable),
+        Commands::Install { enable, fcitx } => {
+            install_service(enable)?;
+            if fcitx {
+                install_fcitx()?;
+            }
+            Ok(())
+        }
+        Commands::MicTest { secs, device } => {
+            let dev = device
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let d = cfg.input_device.trim();
+                    if d.is_empty() {
+                        None
+                    } else {
+                        Some(d)
+                    }
+                });
+            println!(
+                "mic test: {:.1}s @ {} Hz, device={}",
+                secs,
+                cfg.sample_rate,
+                dev.unwrap_or("(default)")
+            );
+            let (peak, rms, bytes) =
+                capture::measure_levels(cfg.sample_rate, dev, secs)?;
+            let secs_got = bytes as f64 / (cfg.sample_rate as f64 * 2.0);
+            println!("captured: {secs_got:.2}s  peak={peak}  rms={rms:.0}");
+            let hint = if peak < 200 {
+                "信号过弱 — 检查静音/输入设备，或改用内置麦；可设 near_field=false 再试"
+            } else if peak < 1500 {
+                "偏轻但可用 — 近讲模式可开；USB 麦可调大系统输入音量"
+            } else if peak > 28000 {
+                "很响 — 注意削波；可降低系统输入增益"
+            } else {
+                "电平正常"
+            };
+            println!("评估: {hint}");
+            Ok(())
+        }
+        Commands::MicList => {
+            let devices = capture::list_input_devices();
+            if devices.is_empty() {
+                println!("(未列出设备 — 安装 pactl 或 wpctl，或保持 input_device 为空用默认)");
+            } else {
+                println!("capture sources:");
+                for d in devices {
+                    println!("  {d}");
+                }
+                println!("\n写入配置: xai-dict config set input_device '<name>'");
+            }
+            Ok(())
+        }
         Commands::Dict { max_secs } => match cfg.provider {
             Provider::Qwen3 | Provider::Local => run_oneshot(cfg, max_secs).await,
             Provider::Xai if cli.stream => run_stream(cfg, cli.api_key.as_deref(), max_secs).await,
@@ -441,6 +510,39 @@ async fn wait_for_stop(max_secs: u64) {
     }
 }
 
+fn install_fcitx() -> Result<()> {
+    // Prefer repo tree (cargo run / git checkout), else next to installed share data.
+    let candidates = [
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fcitx5-xaidict/install-user.sh"),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join("Projects/rust/xai-dict/fcitx5-xaidict/install-user.sh"),
+        PathBuf::from("/usr/share/xai-dict/fcitx5-xaidict/install-user.sh"),
+    ];
+    let script = candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "找不到 fcitx5-xaidict/install-user.sh\n\
+             请在源码树执行: cd fcitx5-xaidict && ./install-user.sh"
+        )
+    })?;
+    println!("running {}", script.display());
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        anyhow::bail!("fcitx install failed ({status})");
+    }
+    // Avoid double-trigger with Super+V when Right-Alt also fires.
+    let cfg = Config::load();
+    if cfg.hotkey != "none" {
+        println!(
+            "提示: fcitx 已装 Super+V/F9。若与内置热键重复，可: xai-dict config set hotkey none"
+        );
+    }
+    Ok(())
+}
+
 fn install_service(enable: bool) -> Result<()> {
     let home = dirs::home_dir().context("HOME")?;
     let cargo_bin = home.join(".cargo/bin/xai-dict");
@@ -616,15 +718,22 @@ WantedBy=default.target
     println!(
         r#"
 === 全局热键（已内置）===
-  右 Alt 点按 → 开始/结束录音
-  识别结果会自动填入当前输入框（ydotool）
+  右 Alt 点按 → 开始/结束录音（toggle）
+  或设 hotkey_mode = "ptt" → 按住说话、松手定稿
+  识别结果优先经 fcitx Commit 上屏，否则 clipboard / ydotool
 
 配置: ~/.config/xai-dict/config.toml
   hotkey = "rightalt"
+  hotkey_mode = "toggle"   # 或 "ptt"
   paste = true
+
+fcitx5 插件（与拼音并存）:
+  xai-dict install --fcitx
+  # Super+V / F9 开关听写
 
 调试:
   xai-dict status
+  xai-dict mic-test
   journalctl --user -u xai-dict -f
   systemctl --user status ydotoold
 "#

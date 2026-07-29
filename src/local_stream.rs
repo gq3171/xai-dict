@@ -179,6 +179,15 @@ pub fn ensure_warm(model_dir: &Path, threads: u32, sample_rate: u32) -> Result<(
     Ok(())
 }
 
+/// Kill dead worker, respawn, and start a fresh utterance. Used after feed/START failures.
+pub fn recover(model_dir: &Path, threads: u32, sample_rate: u32) -> Result<()> {
+    if let Ok(mut g) = WORKER.lock() {
+        *g = None;
+    }
+    ensure_warm(model_dir, threads, sample_rate)?;
+    start_utterance()
+}
+
 pub fn start_utterance() -> Result<()> {
     with_worker(|w| {
         writeln!(w.stdin, "START")?;

@@ -139,6 +139,15 @@ pub fn set_key(key: &str, value: &str) -> Result<()> {
             };
         }
         "hotkey" => cfg.hotkey = value.to_string(),
+        "hotkey_mode" => {
+            let v = value.to_ascii_lowercase();
+            cfg.hotkey_mode = match v.as_str() {
+                "toggle" | "click" | "tap" => "toggle".into(),
+                "ptt" | "hold" | "push" | "push-to-talk" | "pushtotalk" => "ptt".into(),
+                _ => bail!("hotkey_mode must be toggle|ptt"),
+            };
+        }
+        "input_device" => cfg.input_device = value.to_string(),
         "language" => cfg.language = value.to_string(),
         "paste" => cfg.paste = parse_bool(value)?,
         "proxy" => cfg.proxy = value.to_string(),

@@ -1,11 +1,12 @@
-//! Background daemon: Right-Alt hotkey + Unix socket control.
+//! Background daemon: global hotkey + Unix socket control.
 //!
-//! - **Press** Right Alt → toggle recording (start / stop)
+//! - **toggle** mode: press hotkey → start / stop
+//! - **ptt** mode: hold hotkey → speak; release → finalize
 //! - While recording with `stream = true`, phrases are ASR'd and committed live
-//! - Also: `xai-dict toggle` over the socket
+//! - Also: `xai-dict toggle` / `start` / `stop` over the socket
 
 use crate::config::Config;
-use crate::hotkey;
+use crate::hotkey::{self, HotkeyEvent};
 use crate::notify;
 use crate::output;
 use crate::pipeline::{self, DualEvent, LiveCapture};
@@ -131,17 +132,24 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
     let _ = std::fs::write(pid_path(), format!("{}\n", std::process::id()));
 
-    let (hk_tx, mut hk_rx) = mpsc::unbounded_channel::<()>();
+    let ptt = cfg.is_ptt();
+    let (hk_tx, mut hk_rx) = mpsc::unbounded_channel::<HotkeyEvent>();
     let hk_stop = if let Some(key) = hotkey::parse_key(&cfg.hotkey) {
         let label = hotkey::key_label(key);
-        tracing::info!(key = ?key, "enabling global hotkey (press = toggle)");
+        let mode = if ptt { "ptt (hold)" } else { "toggle" };
+        tracing::info!(key = ?key, ptt, "enabling global hotkey");
         let stream_hint = if cfg.stream { " · 流式上屏" } else { "" };
+        let usage = if ptt {
+            format!("按住 {label} 说话，松手定稿{stream_hint}")
+        } else {
+            format!("按 {label} 开始/结束{stream_hint}")
+        };
         eprintln!(
-            "xai-dict daemon: hotkey = {label}  (press = start/stop{stream_hint})\n  socket {}",
+            "xai-dict daemon: hotkey = {label} ({mode})\n  {usage}\n  socket {}",
             sock.display()
         );
-        notify::idle(&format!("已启动 · 按 {label} 开始/结束{stream_hint}"));
-        Some(hotkey::spawn_listener(key, hk_tx))
+        notify::idle(&format!("已启动 · {usage}"));
+        Some(hotkey::spawn_listener(key, ptt, hk_tx))
     } else {
         eprintln!(
             "xai-dict daemon: hotkey disabled\n  socket {} — use: xai-dict toggle",
@@ -154,6 +162,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     tracing::info!(
         path = %sock.display(),
         stream = cfg.stream,
+        ptt,
+        input_device = %cfg.input_device,
         "xai-dict daemon listening"
     );
 
@@ -253,8 +263,20 @@ pub async fn run(cfg: Config) -> Result<()> {
                 }
                 auto_stop.as_mut().reset(tokio::time::Instant::now() + DISARM);
             }
-            Some(()) = hk_rx.recv() => {
-                let _ = cmd_tx.send(SessionCmd::Toggle { reply: None });
+            Some(ev) = hk_rx.recv() => {
+                if ptt {
+                    match ev {
+                        HotkeyEvent::Press => {
+                            let _ = cmd_tx.send(SessionCmd::Start);
+                        }
+                        HotkeyEvent::Release => {
+                            // PTT: always honor release (no short-press debounce).
+                            let _ = cmd_tx.send(SessionCmd::Stop);
+                        }
+                    }
+                } else if matches!(ev, HotkeyEvent::Press) {
+                    let _ = cmd_tx.send(SessionCmd::Toggle { reply: None });
+                }
             }
             Some(done) = asr_done_rx.recv() => {
                 let mut st = state.lock().await;
@@ -515,12 +537,21 @@ async fn start_recording(cfg: &Config) -> Result<RecordingSession> {
         "capture gates"
     );
 
+    let device = {
+        let d = cfg.input_device.trim();
+        if d.is_empty() {
+            None
+        } else {
+            Some(d)
+        }
+    };
+
     let mut capture = if dual {
-        LiveCapture::start_dual(cfg.sample_rate, vad, tune)?
+        LiveCapture::start_dual(cfg.sample_rate, device, vad, tune)?
     } else if use_stream {
-        LiveCapture::start_streaming(cfg.sample_rate, vad, tune)?
+        LiveCapture::start_streaming(cfg.sample_rate, device, vad, tune)?
     } else {
-        LiveCapture::start(cfg.sample_rate)?
+        LiveCapture::start_with_device(cfg.sample_rate, device)?
     };
 
     let stream_join = if dual {
@@ -548,7 +579,7 @@ async fn start_recording(cfg: &Config) -> Result<RecordingSession> {
 }
 
 /// Dual-model live path (ordered events: Chunk then Segment for each phrase):
-/// - Zipformer: continuous partials → fcitx Preedit (provisional, filtered)
+/// - Stream model: continuous partials → fcitx Preedit (provisional, filtered)
 /// - Qwen3: on each VAD phrase → Commit final (source of truth)
 async fn dual_worker(
     cfg: Config,
@@ -556,13 +587,17 @@ async fn dual_worker(
 ) -> StreamOutcome {
     let mut committed = String::new();
     let mut phrases = 0u32;
-    // Latest raw Zipformer decode (may be wild); used only for short fallback.
+    let mut dropped = 0u32;
+    let mut stream_restarts = 0u32;
+    // Latest raw stream decode (may be wild); used only for short fallback.
     let mut last_partial = String::new();
     // What we actually pushed to fcitx preedit (stability-gated).
     let mut shown_preedit = String::new();
     let mut pending_preedit = String::new();
     let mut pending_hits: u8 = 0;
     let show_preedit = cfg.dual_preedit;
+    let session_t0 = std::time::Instant::now();
+    let mut first_preedit_ms: Option<u64> = None;
 
     let sdir = std::path::PathBuf::from(&cfg.stream_model_dir);
     let qdir = std::path::PathBuf::from(&cfg.qwen3_model_dir);
@@ -571,8 +606,9 @@ async fn dual_worker(
     let qthr = cfg.local_threads;
     let qtok = cfg.qwen3_max_new_tokens;
     let hot = cfg.qwen3_hotwords.clone();
+    let sdir_w = sdir.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let _ = crate::local_stream::ensure_warm(&sdir, thr, sr);
+        let _ = crate::local_stream::ensure_warm(&sdir_w, thr, sr);
         let _ = crate::local_qwen3::ensure_warm(&qdir, qthr, qtok, &hot);
     })
     .await;
@@ -581,16 +617,26 @@ async fn dual_worker(
         .await
         .unwrap_or(Err(anyhow::anyhow!("join")));
     if let Err(e) = start_ok {
-        tracing::warn!("zipformer START failed: {e:#} — phrase-only fallback");
-        // Convert remaining dual events to segments only.
-        let (stx, srx) = mpsc::unbounded_channel();
-        while let Some(ev) = events.recv().await {
-            if let DualEvent::Segment(s) = ev {
-                let _ = stx.send(s);
+        tracing::warn!("stream START failed: {e:#} — trying recover once");
+        let sdir2 = sdir.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            crate::local_stream::recover(&sdir2, thr, sr)
+        })
+        .await
+        .unwrap_or(Err(anyhow::anyhow!("join")));
+        if let Err(e2) = recovered {
+            tracing::warn!("stream recover failed: {e2:#} — phrase-only fallback");
+            notify::error("流式模型异常，已降级为按句定稿");
+            let (stx, srx) = mpsc::unbounded_channel();
+            while let Some(ev) = events.recv().await {
+                if let DualEvent::Segment(s) = ev {
+                    let _ = stx.send(s);
+                }
             }
+            drop(stx);
+            return stream_worker(cfg, srx).await;
         }
-        drop(stx);
-        return stream_worker(cfg, srx).await;
+        stream_restarts += 1;
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -612,38 +658,65 @@ async fn dual_worker(
                         if !show_preedit {
                             continue;
                         }
-                        // Ignore Zipformer endpoint; VAD owns phrase cuts.
+                        // Ignore stream endpoint; VAD owns phrase cuts.
                         if let Some(to_show) = preedit_update(
                             &mut shown_preedit,
                             &mut pending_preedit,
                             &mut pending_hits,
                             &raw,
                         ) {
+                            if first_preedit_ms.is_none() && !to_show.is_empty() {
+                                first_preedit_ms = Some(session_t0.elapsed().as_millis() as u64);
+                            }
                             let t = to_show;
                             let _ = tokio::task::spawn_blocking(move || output::set_preedit(&t))
                                 .await;
                         }
                     }
-                    Err(e) => tracing::debug!("zipformer feed: {e:#}"),
+                    Err(e) => {
+                        tracing::warn!("stream feed: {e:#}");
+                        dropped += 1;
+                        // One-shot recover mid-utterance so preedit can resume.
+                        if stream_restarts < 2 {
+                            let sdir2 = sdir.clone();
+                            let ok = tokio::task::spawn_blocking(move || {
+                                crate::local_stream::recover(&sdir2, thr, sr)
+                            })
+                            .await
+                            .unwrap_or(Err(anyhow::anyhow!("join")));
+                            if ok.is_ok() {
+                                stream_restarts += 1;
+                                tracing::info!(stream_restarts, "stream worker recovered");
+                            } else {
+                                tracing::warn!("stream recover failed mid-session");
+                            }
+                        }
+                    }
                 }
             }
             DualEvent::Segment(seg) => {
                 let secs = seg.pcm.len() as f64 / (cfg.sample_rate as f64 * 2.0);
                 let zip_snapshot = last_partial.clone();
+                let (peak, rms) = crate::wav::pcm16_levels(&seg.pcm);
                 tracing::info!(
                     secs,
+                    peak,
+                    rms = format!("{rms:.0}"),
                     zip_n = zip_snapshot.chars().count(),
                     "dual: VAD phrase → Qwen3 finalize"
                 );
 
+                let t_asr = std::time::Instant::now();
                 let qwen_text =
                     match pipeline::transcribe_pcm(&cfg, cfg.sample_rate, &seg.pcm).await {
                         Ok(t) => t.trim().to_string(),
                         Err(e) => {
                             tracing::debug!("Qwen3 finalize fail: {e:#}");
+                            dropped += 1;
                             String::new()
                         }
                     };
+                let qwen_ms = t_asr.elapsed().as_millis() as u64;
 
                 let final_text = pick_dual_final(&qwen_text, &zip_snapshot, secs);
                 last_partial.clear();
@@ -653,33 +726,47 @@ async fn dual_worker(
                 let _ = tokio::task::spawn_blocking(output::clear_preedit).await;
 
                 if final_text.is_empty() {
-                    tracing::debug!("skip empty finalize (no Qwen3; Zipformer not trusted)");
+                    tracing::info!(
+                        secs,
+                        qwen_ms,
+                        peak,
+                        "metric: phrase dropped (empty final)"
+                    );
                     let _ = tokio::task::spawn_blocking(crate::local_stream::start_utterance).await;
                     continue;
                 }
 
                 let paste = cfg.paste;
                 let text_c = final_text.clone();
+                let t_commit = std::time::Instant::now();
                 let committed_ok = tokio::task::spawn_blocking(move || {
                     output::commit_final(&text_c, paste)
                 })
                 .await
                 .unwrap_or(Ok(false));
+                let commit_ms = t_commit.elapsed().as_millis() as u64;
 
                 match committed_ok {
                     Ok(true) => {
                         append_phrase(&mut committed, &final_text);
                         phrases += 1;
                         tracing::info!(
-                            n = final_text.len(),
+                            n = final_text.chars().count(),
                             phrases,
-                            "dual: committed (Qwen3)"
+                            secs = format!("{secs:.2}"),
+                            qwen_ms,
+                            commit_ms,
+                            peak,
+                            "metric: phrase committed"
                         );
                     }
                     Ok(false) => {
                         append_phrase(&mut committed, &final_text);
                         phrases += 1;
-                        tracing::warn!("dual: commit failed, text kept in report");
+                        tracing::warn!(
+                            qwen_ms,
+                            "dual: commit failed, text kept in report"
+                        );
                     }
                     Err(e) => tracing::warn!("dual commit: {e:#}"),
                 }
@@ -689,11 +776,20 @@ async fn dual_worker(
         }
     }
 
-    // Never commit raw Zipformer leftover as "final" — that was a major source of
+    // Never commit raw stream leftover as "final" — that was a major source of
     // preedit/final mismatch. Short takes with no VAD phrase fall through to
     // full-buffer Qwen3 in finish_and_deliver.
     let _ = tokio::task::spawn_blocking(output::clear_preedit).await;
     let _ = tokio::task::spawn_blocking(crate::local_stream::finish_utterance).await;
+
+    tracing::info!(
+        phrases,
+        dropped,
+        stream_restarts,
+        first_preedit_ms = first_preedit_ms.unwrap_or(0),
+        session_ms = session_t0.elapsed().as_millis() as u64,
+        "metric: dual session summary"
+    );
 
     StreamOutcome {
         committed,
@@ -844,24 +940,36 @@ fn append_phrase(committed: &mut String, piece: &str) {
     committed.push_str(piece);
 }
 
-/// Phrase-only (no Zipformer): each VAD phrase → Qwen3 → commit.
+/// Phrase-only (no stream preedit): each VAD phrase → Qwen3 → commit.
 async fn stream_worker(
     cfg: Config,
     mut rx: mpsc::UnboundedReceiver<SpeechSegment>,
 ) -> StreamOutcome {
     let mut committed = String::new();
     let mut phrases = 0u32;
+    let mut dropped = 0u32;
     let mut first = true;
+    let session_t0 = std::time::Instant::now();
 
     while let Some(seg) = rx.recv().await {
         let secs = seg.pcm.len() as f64 / (cfg.sample_rate as f64 * 2.0);
-        tracing::info!(secs, bytes = seg.pcm.len(), "stream segment ready");
+        let (peak, rms) = crate::wav::pcm16_levels(&seg.pcm);
+        tracing::info!(
+            secs,
+            bytes = seg.pcm.len(),
+            peak,
+            rms = format!("{rms:.0}"),
+            "stream segment ready"
+        );
 
+        let t0 = std::time::Instant::now();
         match pipeline::transcribe_pcm(&cfg, cfg.sample_rate, &seg.pcm).await {
             Ok(text) => {
                 let text = text.trim().to_string();
+                let asr_ms = t0.elapsed().as_millis() as u64;
                 if text.is_empty() {
-                    tracing::debug!("stream segment empty ASR");
+                    dropped += 1;
+                    tracing::info!(secs, asr_ms, peak, "metric: phrase empty");
                     continue;
                 }
                 let piece = text;
@@ -870,7 +978,14 @@ async fn stream_worker(
                         append_phrase(&mut committed, &piece);
                         phrases += 1;
                         first = false;
-                        tracing::info!(n = piece.len(), phrases, "stream phrase committed");
+                        tracing::info!(
+                            n = piece.chars().count(),
+                            phrases,
+                            asr_ms,
+                            secs = format!("{secs:.2}"),
+                            peak,
+                            "metric: phrase committed"
+                        );
                     }
                     Ok(false) => {
                         tracing::warn!("stream phrase not delivered: {piece}");
@@ -881,10 +996,18 @@ async fn stream_worker(
                 }
             }
             Err(e) => {
+                dropped += 1;
                 tracing::debug!("stream ASR skip: {e:#}");
             }
         }
     }
+
+    tracing::info!(
+        phrases,
+        dropped,
+        session_ms = session_t0.elapsed().as_millis() as u64,
+        "metric: phrase-only session summary"
+    );
 
     StreamOutcome {
         committed,

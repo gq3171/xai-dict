@@ -15,14 +15,16 @@ import urllib.request
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QKeyEvent
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -31,8 +33,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QDoubleSpinBox,
     QTabWidget,
@@ -98,6 +100,370 @@ SPACING = 14
 MARGINS = (20, 18, 20, 18)
 GROUP_MARGINS = (16, 20, 16, 16)
 
+# config value → 显示名（daemon 已支持）
+HOTKEY_PRESETS: list[tuple[str, str]] = [
+    ("rightalt", "右 Alt"),
+    ("leftalt", "左 Alt"),
+    ("rightctrl", "右 Ctrl"),
+    ("leftctrl", "左 Ctrl"),
+    ("f8", "F8"),
+    ("f9", "F9"),
+    ("f10", "F10"),
+    ("pause", "Pause"),
+    ("scrolllock", "ScrollLock"),
+    ("insert", "Insert"),
+    ("capslock", "CapsLock"),
+    ("none", "关闭"),
+]
+
+HOTKEY_LABELS = {k: lab for k, lab in HOTKEY_PRESETS}
+HOTKEY_LABELS.update(
+    {
+        "rightshift": "右 Shift",
+        "leftshift": "左 Shift",
+        "rightmeta": "右 Super",
+        "leftmeta": "左 Super",
+        "home": "Home",
+        "end": "End",
+        "delete": "Delete",
+        "menu": "Menu",
+        "f1": "F1",
+        "f2": "F2",
+        "f3": "F3",
+        "f4": "F4",
+        "f5": "F5",
+        "f6": "F6",
+        "f7": "F7",
+        "f11": "F11",
+        "f12": "F12",
+    }
+)
+
+
+def hotkey_display(value: str) -> str:
+    v = (value or "rightalt").strip().lower().replace("-", "").replace(" ", "")
+    aliases = {
+        "ralt": "rightalt",
+        "altr": "rightalt",
+        "alt_r": "rightalt",
+        "lalt": "leftalt",
+        "alt_l": "leftalt",
+        "alt": "leftalt",
+        "rctrl": "rightctrl",
+        "lctrl": "leftctrl",
+        "ctrl": "leftctrl",
+        "off": "none",
+        "disabled": "none",
+    }
+    v = aliases.get(v, v)
+    return HOTKEY_LABELS.get(v, value or "右 Alt")
+
+
+def qt_key_to_hotkey(event: QKeyEvent) -> str | None:
+    """Map a Qt key event to our config token. None = ignore (modifiers alone mid-chord)."""
+    key = event.key()
+    # Escape cancels capture in the widget, not a binding here.
+    if key in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
+        return None
+
+    # Distinguish left/right via native scan codes when possible (Linux evdev-ish).
+    # X11/Wayland scan codes vary; fall back to key() only.
+    sc = int(event.nativeScanCode()) if event.nativeScanCode() else 0
+    # Common Linux keycodes (not scan codes) sometimes appear as virtual key.
+    vk = int(event.nativeVirtualKey()) if event.nativeVirtualKey() else 0
+
+    # Prefer explicit right/left keys when Qt provides them.
+    if key == Qt.Key.Key_Alt:
+        # AltGr often reports as Key_AltGr; plain Alt is usually left.
+        # Scan code 108 ≈ KEY_RIGHTALT, 56 ≈ KEY_LEFTALT on many boards.
+        if sc in (108, 100) or vk in (0xffea,):  # XK_Alt_R-ish
+            return "rightalt"
+        return "leftalt"
+    if key == Qt.Key.Key_AltGr:
+        return "rightalt"
+    if key == Qt.Key.Key_Control:
+        # 105 right ctrl, 29 left
+        if sc in (105, 97):
+            return "rightctrl"
+        return "leftctrl"
+    if key == Qt.Key.Key_Shift:
+        if sc in (62, 54):
+            return "rightshift"
+        return "leftshift"
+    if key in (Qt.Key.Key_Meta, Qt.Key.Key_Super_L, Qt.Key.Key_Super_R):
+        # Super alone is risky (opens overview); still allow if user insists.
+        if sc in (126, 134) or key == Qt.Key.Key_Super_R:
+            return "rightmeta"
+        return "leftmeta"
+    if key == Qt.Key.Key_CapsLock:
+        return "capslock"
+    if key == Qt.Key.Key_ScrollLock:
+        return "scrolllock"
+    if key == Qt.Key.Key_Pause:
+        return "pause"
+    if key == Qt.Key.Key_Insert:
+        return "insert"
+    if key == Qt.Key.Key_Home:
+        return "home"
+    if key == Qt.Key.Key_End:
+        return "end"
+    if key == Qt.Key.Key_Delete:
+        return "delete"
+    if key == Qt.Key.Key_Menu:
+        return "menu"
+
+    f_map = {
+        Qt.Key.Key_F1: "f1",
+        Qt.Key.Key_F2: "f2",
+        Qt.Key.Key_F3: "f3",
+        Qt.Key.Key_F4: "f4",
+        Qt.Key.Key_F5: "f5",
+        Qt.Key.Key_F6: "f6",
+        Qt.Key.Key_F7: "f7",
+        Qt.Key.Key_F8: "f8",
+        Qt.Key.Key_F9: "f9",
+        Qt.Key.Key_F10: "f10",
+        Qt.Key.Key_F11: "f11",
+        Qt.Key.Key_F12: "f12",
+    }
+    if key in f_map:
+        return f_map[key]
+
+    # Letter/number alone — usually bad as global hotkey; reject.
+    return None
+
+
+class HotkeyPicker(QWidget):
+    """Visual hotkey chooser: big keycap + presets + capture."""
+
+    changed = pyqtSignal(str)
+
+    def __init__(self, initial: str = "rightalt", parent=None):
+        super().__init__(parent)
+        self._value = (initial or "rightalt").strip().lower() or "rightalt"
+        self._capturing = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        # Current binding display
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        self.cap = QLabel()
+        self.cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cap.setMinimumHeight(56)
+        self.cap.setMinimumWidth(160)
+        self.cap.setStyleSheet(
+            """
+            QLabel {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #fafafa, stop:1 #e8e8ec);
+                border: 2px solid #3b82f6;
+                border-radius: 10px;
+                font-size: 18px;
+                font-weight: 700;
+                color: #111;
+                padding: 8px 18px;
+            }
+            """
+        )
+        row.addWidget(self.cap, 0)
+
+        col = QVBoxLayout()
+        col.setSpacing(6)
+        self.btn_capture = QPushButton("点击后按下新快捷键…")
+        self.btn_capture.setMinimumHeight(36)
+        self.btn_capture.setCheckable(True)
+        self.btn_capture.clicked.connect(self._toggle_capture)
+        self.btn_clear = QPushButton("关闭热键")
+        self.btn_clear.setMinimumHeight(36)
+        self.btn_clear.clicked.connect(lambda: self.set_value("none"))
+        col.addWidget(self.btn_capture)
+        col.addWidget(self.btn_clear)
+        row.addLayout(col, 1)
+        root.addLayout(row)
+
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color: #666; font-size: 12px;")
+        root.addWidget(self.hint)
+
+        # Preset grid
+        grid_lab = QLabel("常用快捷键")
+        grid_lab.setStyleSheet("font-weight: 600; margin-top: 4px;")
+        root.addWidget(grid_lab)
+
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        self._preset_btns: list[QPushButton] = []
+        for i, (val, lab) in enumerate(HOTKEY_PRESETS):
+            b = QPushButton(lab)
+            b.setMinimumHeight(34)
+            b.setCheckable(True)
+            b.setProperty("hotkey_value", val)
+            b.clicked.connect(lambda _=False, v=val: self.set_value(v))
+            grid.addWidget(b, i // 4, i % 4)
+            self._preset_btns.append(b)
+        root.addLayout(grid)
+
+        note = QLabel(
+            "说明：这是 daemon 全局热键（需用户在 input 组）。"
+            "fcitx 插件另有 Super+V / F9，与这里独立。"
+            "不建议绑单字母键，避免误触。"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #888; font-size: 11px;")
+        root.addWidget(note)
+
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._refresh()
+
+    def value(self) -> str:
+        return self._value
+
+    def set_value(self, v: str) -> None:
+        v = (v or "rightalt").strip().lower() or "rightalt"
+        self._value = v
+        self._stop_capture()
+        self._refresh()
+        self.changed.emit(self._value)
+
+    def _refresh(self) -> None:
+        lab = hotkey_display(self._value)
+        if self._value in ("none", "off", "disabled"):
+            self.cap.setText("（未绑定）")
+            self.cap.setStyleSheet(
+                """
+                QLabel {
+                    background: #f4f4f5;
+                    border: 2px dashed #aaa;
+                    border-radius: 10px;
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: #666;
+                    padding: 8px 18px;
+                }
+                """
+            )
+            self.hint.setText("内置热键已关闭，可用 fcitx Super+V/F9 或系统快捷键绑 xai-dict toggle。")
+        else:
+            self.cap.setText(lab)
+            self.cap.setStyleSheet(
+                """
+                QLabel {
+                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                        stop:0 #fafafa, stop:1 #e8e8ec);
+                    border: 2px solid #3b82f6;
+                    border-radius: 10px;
+                    font-size: 18px;
+                    font-weight: 700;
+                    color: #111;
+                    padding: 8px 18px;
+                }
+                """
+            )
+            self.hint.setText(f"当前绑定：{lab}  （配置值 hotkey = \"{self._value}\"）")
+
+        for b in self._preset_btns:
+            b.setChecked(b.property("hotkey_value") == self._value)
+
+    def _toggle_capture(self) -> None:
+        if self._capturing:
+            self._stop_capture()
+        else:
+            self._start_capture()
+
+    def _start_capture(self) -> None:
+        self._capturing = True
+        self.btn_capture.setChecked(True)
+        self.btn_capture.setText("按下键盘上的键…（Esc 取消）")
+        self.cap.setText("…")
+        self.hint.setText("正在录制：请按下一个键。不支持 Ctrl+字母 组合，请用单键。")
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        # grab keyboard so other widgets don't eat the key
+        self.grabKeyboard()
+
+    def _stop_capture(self) -> None:
+        if self._capturing:
+            self.releaseKeyboard()
+        self._capturing = False
+        self.btn_capture.setChecked(False)
+        self.btn_capture.setText("点击后按下新快捷键…")
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if not self._capturing:
+            super().keyPressEvent(event)
+            return
+        if event.isAutoRepeat():
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self._stop_capture()
+            self._refresh()
+            event.accept()
+            return
+        mapped = qt_key_to_hotkey(event)
+        if mapped is None:
+            self.hint.setText(
+                "无法绑定此键（组合键/字母键）。请试 Alt / Ctrl / F 键 / Pause 等。"
+            )
+            event.accept()
+            return
+        self.set_value(mapped)
+        event.accept()
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        # Don't cancel capture immediately — grabKeyboard keeps keys coming.
+        super().focusOutEvent(event)
+
+
+class ModePicker(QWidget):
+    """Toggle vs PTT as two large radio cards."""
+
+    def __init__(self, initial: str = "toggle", parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+
+        self.grp = QButtonGroup(self)
+        self.r_toggle = QRadioButton("点按切换（Toggle）")
+        self.r_ptt = QRadioButton("按住说话（PTT）")
+        for r in (self.r_toggle, self.r_ptt):
+            r.setMinimumHeight(40)
+            r.setStyleSheet("QRadioButton { font-size: 13px; padding: 6px; }")
+            self.grp.addButton(r)
+            lay.addWidget(r, 1)
+
+        if (initial or "toggle").lower() in ("ptt", "hold", "push"):
+            self.r_ptt.setChecked(True)
+        else:
+            self.r_toggle.setChecked(True)
+
+        self.desc = QLabel()
+        self.desc.setWordWrap(True)
+        self.desc.setStyleSheet("color: #666; font-size: 12px;")
+        # parent form will place desc separately if needed
+        self.r_toggle.toggled.connect(self._update_desc)
+        self._update_desc()
+
+    def _update_desc(self) -> None:
+        if self.r_ptt.isChecked():
+            self.desc.setText("PTT：按住热键开始录音，松开结束并定稿。")
+        else:
+            self.desc.setText("Toggle：按一下开始，再按一下结束。")
+
+    def value(self) -> str:
+        return "ptt" if self.r_ptt.isChecked() else "toggle"
+
+    def set_value(self, v: str) -> None:
+        if (v or "").lower() in ("ptt", "hold", "push"):
+            self.r_ptt.setChecked(True)
+        else:
+            self.r_toggle.setChecked(True)
+        self._update_desc()
+
 
 def config_path() -> Path:
     if env := os.environ.get("XAI_DICT_CONFIG"):
@@ -123,6 +489,8 @@ def load_config(path: Path) -> dict:
         "qwen3_max_new_tokens": 128,
         "qwen3_hotwords": "",
         "hotkey": "rightalt",
+        "hotkey_mode": "toggle",
+        "input_device": "",
         "stream": True,
         "stream_min_silence_ms": 600,
         "stream_max_segment_ms": 12000,
@@ -196,6 +564,8 @@ def save_config(path: Path, cfg: dict) -> None:
         f"qwen3_hotwords = {toml_escape(str(cfg.get('qwen3_hotwords', '')))}",
         "",
         f"hotkey = {toml_escape(str(cfg.get('hotkey', 'rightalt')))}",
+        f"hotkey_mode = {toml_escape(str(cfg.get('hotkey_mode', 'toggle')))}",
+        f"input_device = {toml_escape(str(cfg.get('input_device', '')))}",
         "",
         f"stream = {'true' if cfg.get('stream', True) else 'false'}",
         f"stream_min_silence_ms = {int(cfg.get('stream_min_silence_ms', 600))}",
@@ -241,6 +611,42 @@ def daemon_status() -> str:
         return (r.stdout or r.stderr or "unknown").strip()
     except Exception:
         return "unknown"
+
+
+def which_xai_dict() -> str | None:
+    return shutil.which("xai-dict")
+
+
+def run_xai(args: list[str], timeout: float = 20) -> tuple[int, str]:
+    bin_ = which_xai_dict()
+    if not bin_:
+        # fall back to cargo-run style when developing from source
+        return 127, "xai-dict 不在 PATH"
+    try:
+        r = subprocess.run(
+            [bin_, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        return r.returncode, out.strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def list_mic_devices() -> list[str]:
+    code, out = run_xai(["mic-list"], timeout=8)
+    if code != 0:
+        return []
+    names: list[str] = []
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("capture") or s.startswith("写入") or s.startswith("("):
+            continue
+        if s:
+            names.append(s)
+    return names
 
 
 def model_installed(key: str) -> tuple[bool, Path]:
@@ -545,15 +951,6 @@ class SettingsWindow(QMainWindow):
         f.addRow("识别后端", self.provider)
         f.addRow("", hint("本地听写选 qwen3；仅云端调试时用 xai。"))
 
-        self.hotkey = QComboBox()
-        self.hotkey.addItem("右 Alt（默认）", "rightalt")
-        self.hotkey.addItem("左 Alt", "leftalt")
-        self.hotkey.addItem("关闭内置热键（只用 xai-dict toggle）", "none")
-        self._set_combo_data(self.hotkey, str(self.cfg.get("hotkey", "rightalt")))
-        self.hotkey.setMinimumHeight(34)
-        f.addRow("内置热键", self.hotkey)
-        f.addRow("", hint("daemon 内监听的按键；也可在系统设置里绑 xai-dict toggle。"))
-
         self.language = QLineEdit(str(self.cfg.get("language", "zh")))
         self.language.setMinimumHeight(34)
         self.language.setPlaceholderText("zh / en / auto")
@@ -572,6 +969,75 @@ class SettingsWindow(QMainWindow):
         f.addRow("", hint("Qwen3 / Whisper 推理线程，建议 4–8。"))
         lay.addWidget(g)
 
+        # --- Visual hotkey panel ---
+        g_hk, f_hk = roomy_group("全局快捷键（可视化）")
+        self.hotkey_picker = HotkeyPicker(str(self.cfg.get("hotkey", "rightalt")))
+        f_hk.addRow(self.hotkey_picker)
+
+        self.mode_picker = ModePicker(str(self.cfg.get("hotkey_mode", "toggle")))
+        f_hk.addRow("触发方式", self.mode_picker)
+        f_hk.addRow("", self.mode_picker.desc)
+        f_hk.addRow(
+            "",
+            hint(
+                "保存并重启后生效。PTT 只对这里的 daemon 热键有效；"
+                "fcitx 的 Super+V 仍是点按。"
+            ),
+        )
+        lay.addWidget(g_hk)
+
+        # keep aliases for collect()
+        self.hotkey = self.hotkey_picker
+        self.hotkey_mode = self.mode_picker
+
+        g_mic, f_mic = roomy_group("麦克风")
+        self.input_device = QComboBox()
+        self.input_device.setEditable(True)
+        self.input_device.setMinimumHeight(34)
+        self.input_device.addItem("（系统默认）", "")
+        for name in list_mic_devices():
+            self.input_device.addItem(name, name)
+        cur_dev = str(self.cfg.get("input_device", "")).strip()
+        if cur_dev:
+            # ensure current value is in list
+            found = False
+            for i in range(self.input_device.count()):
+                if self.input_device.itemData(i) == cur_dev or self.input_device.itemText(i) == cur_dev:
+                    self.input_device.setCurrentIndex(i)
+                    found = True
+                    break
+            if not found:
+                self.input_device.addItem(cur_dev, cur_dev)
+                self.input_device.setCurrentIndex(self.input_device.count() - 1)
+        else:
+            self.input_device.setCurrentIndex(0)
+        f_mic.addRow("输入设备", self.input_device)
+        f_mic.addRow(
+            "",
+            hint("PipeWire/Pulse 源名称；空=默认。可用「刷新设备」更新列表。"),
+        )
+
+        self.mic_level = QLabel("电平：尚未测试")
+        self.mic_level.setWordWrap(True)
+        self.mic_level.setStyleSheet(
+            "background: #f4f4f5; border-radius: 8px; padding: 10px; color: #333;"
+        )
+        f_mic.addRow(self.mic_level)
+
+        mic_row = QHBoxLayout()
+        mic_row.setSpacing(12)
+        b_test = QPushButton("测试 3 秒电平")
+        b_test.setMinimumHeight(36)
+        b_test.clicked.connect(self.mic_test)
+        b_refresh_dev = QPushButton("刷新设备")
+        b_refresh_dev.setMinimumHeight(36)
+        b_refresh_dev.clicked.connect(self.refresh_devices)
+        mic_row.addWidget(b_test)
+        mic_row.addWidget(b_refresh_dev)
+        mic_row.addStretch(1)
+        f_mic.addRow(mic_row)
+        lay.addWidget(g_mic)
+
         g2, f2 = roomy_group("快捷操作")
         row = QHBoxLayout()
         row.setSpacing(12)
@@ -581,8 +1047,13 @@ class SettingsWindow(QMainWindow):
         b2 = QPushButton("刷新状态")
         b2.setMinimumHeight(36)
         b2.clicked.connect(self.refresh_status)
+        b3 = QPushButton("安装 fcitx 插件")
+        b3.setMinimumHeight(36)
+        b3.setToolTip("xai-dict install --fcitx（与拼音并存，Super+V / F9）")
+        b3.clicked.connect(self.install_fcitx)
         row.addWidget(b1)
         row.addWidget(b2)
+        row.addWidget(b3)
         row.addStretch(1)
         f2.addRow(row)
         lay.addWidget(g2)
@@ -684,11 +1155,21 @@ class SettingsWindow(QMainWindow):
         self.whisper.setText(str(self.cfg.get("local_model", "")))
         f.addRow("Whisper 文件", self._path_dl_row(self.whisper, "whisper_small"))
 
+        hw_row = QWidget()
+        hw_lay = QHBoxLayout(hw_row)
+        hw_lay.setContentsMargins(0, 0, 0, 0)
+        hw_lay.setSpacing(10)
         self.hotwords = QLineEdit(str(self.cfg.get("qwen3_hotwords", "")))
         self.hotwords.setMinimumHeight(34)
-        self.hotwords.setPlaceholderText("专有名词1,专有名词2")
-        f.addRow("Qwen3 热词", self.hotwords)
-        f.addRow("", hint("逗号分隔，提升人名/术语识别。"))
+        self.hotwords.setPlaceholderText("专有名词1,专有名词2（人名/项目名）")
+        b_paste_hw = QPushButton("粘贴追加")
+        b_paste_hw.setMinimumHeight(32)
+        b_paste_hw.setToolTip("把剪贴板文本作为热词追加（逗号分隔）")
+        b_paste_hw.clicked.connect(self.paste_hotwords)
+        hw_lay.addWidget(self.hotwords, 1)
+        hw_lay.addWidget(b_paste_hw)
+        f.addRow("Qwen3 热词", hw_row)
+        f.addRow("", hint("逗号分隔。改热词后需「保存并重启」才能进常驻 worker。"))
 
         self.max_tok = QSpinBox()
         self.max_tok.setRange(32, 512)
@@ -828,7 +1309,9 @@ class SettingsWindow(QMainWindow):
             "• 日常听写：provider=qwen3 + stream + dual_model。\n"
             "• 旁人干扰：先开「近讲优先」；仍乱再把 vad_snr 调到 2.8–3.5。\n"
             "• 错字变多：降低门限、加长「一句最长」、或关 dual_preedit。\n"
-            "• 改模型/热键后务必「保存并重启」。"
+            "• 按住说话：热键模式选 PTT。\n"
+            "• 改模型/热键/热词后务必「保存并重启」。\n"
+            "• 日志里搜 metric: 可看每句 qwen_ms / 丢句。"
         )
         f3.addRow(note)
         lay.addWidget(g3)
@@ -909,7 +1392,84 @@ class SettingsWindow(QMainWindow):
 
     def refresh_status(self) -> None:
         self.status_label.setText(f"daemon　{daemon_status()}")
-        self.model_status.setText(self._model_status_text())
+        if hasattr(self, "model_status"):
+            self.model_status.setText(self._model_status_text())
+
+    def _current_input_device(self) -> str:
+        data = self.input_device.currentData()
+        if data is not None and str(data).strip():
+            return str(data).strip()
+        text = self.input_device.currentText().strip()
+        if text in ("（系统默认）", "(default)", ""):
+            return ""
+        return text
+
+    def refresh_devices(self) -> None:
+        cur = self._current_input_device()
+        self.input_device.blockSignals(True)
+        self.input_device.clear()
+        self.input_device.addItem("（系统默认）", "")
+        for name in list_mic_devices():
+            self.input_device.addItem(name, name)
+        if cur:
+            self.input_device.addItem(cur, cur)
+            self._set_combo_data(self.input_device, cur)
+        self.input_device.blockSignals(False)
+        QMessageBox.information(
+            self,
+            "设备列表",
+            f"已刷新，共 {self.input_device.count() - 1} 个源。",
+        )
+
+    def mic_test(self) -> None:
+        dev = self._current_input_device()
+        args = ["mic-test", "--secs", "3"]
+        if dev:
+            args.extend(["--device", dev])
+        self.mic_level.setText("测试中…请对着麦克风说话")
+        QApplication.processEvents()
+        code, out = run_xai(args, timeout=15)
+        if code != 0:
+            self.mic_level.setText(f"测试失败：{out or code}")
+            QMessageBox.warning(self, "麦克风测试", out or f"exit {code}")
+            return
+        self.mic_level.setText(out.replace("\n", "  |  "))
+        QMessageBox.information(self, "麦克风测试", out)
+
+    def paste_hotwords(self) -> None:
+        clip = QApplication.clipboard()
+        text = (clip.text() if clip else "") or ""
+        text = text.strip().replace("\n", ",").replace("，", ",")
+        if not text:
+            QMessageBox.information(self, "热词", "剪贴板为空")
+            return
+        cur = self.hotwords.text().strip()
+        # de-dup roughly
+        parts = [p.strip() for p in (cur + "," + text).split(",") if p.strip()]
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for p in parts:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+        self.hotwords.setText(",".join(uniq))
+
+    def install_fcitx(self) -> None:
+        r = QMessageBox.question(
+            self,
+            "安装 fcitx5 插件",
+            "将执行：xai-dict install --fcitx\n"
+            "编译并安装 Module（与拼音并存，Super+V / F9）。\n"
+            "需要本机有 cmake / fcitx5 开发包。继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        code, out = run_xai(["install", "--fcitx", "--enable"], timeout=300)
+        if code == 0:
+            QMessageBox.information(self, "完成", out[-3000:] if out else "OK")
+        else:
+            QMessageBox.warning(self, "安装失败", out or f"exit {code}")
 
     def restart_only(self) -> None:
         ok, detail = restart_daemon()
@@ -1032,7 +1592,9 @@ class SettingsWindow(QMainWindow):
     def collect(self) -> dict:
         c = dict(self.cfg)
         c["provider"] = self._combo_data(self.provider)
-        c["hotkey"] = self._combo_data(self.hotkey)
+        c["hotkey"] = self.hotkey_picker.value()
+        c["hotkey_mode"] = self.mode_picker.value()
+        c["input_device"] = self._current_input_device()
         c["language"] = self.language.text().strip() or "zh"
         c["paste"] = self.paste.isChecked()
         c["proxy_enabled"] = self.proxy_on.isChecked()

@@ -121,24 +121,22 @@ local_threads = 6
 | ASR | 内置 worker / 云 | **自有** Qwen3 / Whisper / xAI |
 | 所有权 | 闭源 worker 曾出问题 | 全开源、可改 |
 
-### fcitx5 输入法插件（真正的 IM）
+### fcitx5 插件（与拼音并存）
 
 ```bash
-cd fcitx5-xaidict && ./install-user.sh   # 编译安装并加入 Default 组
-# 若已安装只需加入切换列表：
-./enable-im.sh
+cd fcitx5-xaidict && ./install-user.sh
 ```
 
-**不要**在 KDE「系统设置 → 虚拟键盘」里找——那里经常列不全 fcitx 自建输入法。
+这是 **常驻 Module**，**不用**切换到「语音听写」输入法，**拼音照常打字**。
 
-| 步骤 | 操作 |
+| 操作 | 说明 |
 |------|------|
-| 配置 | 托盘键盘图标 → 配置，或运行 `fcitx5-configtool` |
-| 切换 | **Ctrl+Space** 循环到 🎤 / xai-dict |
-| 听写 | **Super+V** 或 **F9** 开始/结束 |
-| 命令切换 | `busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 SetCurrentIM s xai-dict` |
+| 输入法 | 保持 **拼音**（或键盘）即可 |
+| 听写热键 | **Super+V** 或 **F9**（全局，不抢拼音） |
+| 上屏 | daemon → fcitx `Commit` / `Preedit` |
+| 也可用 | daemon 右 Alt 全局热键（`hotkey = "rightalt"`） |
 
-右 Alt 全局热键与 IM 内右 Alt 可能重复；建议 `hotkey = "none"` 或只用 Super+V。
+若右 Alt 与插件重复触发，设 `hotkey = "none"`，只用 Super+V。
 
 ## License
 

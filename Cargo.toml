@@ -2,8 +2,28 @@
 name = "xai-dict"
 version = "0.1.0"
 edition = "2021"
-description = "System voice dictation via xAI STT (inspired by xai-grok-voice)"
+description = "System voice dictation via local Qwen3-ASR / streaming preedit (LazyTyper-style)"
 license = "Apache-2.0"
+repository = "https://github.com/gq3171/xai-dict"
+readme = "README.md"
+keywords = ["asr", "dictation", "speech", "linux", "ime"]
+categories = ["command-line-utilities", "multimedia"]
+
+# Prefer packaging/build-deb.sh for GitHub Releases (bundles workers + runtime libs).
+# cargo-deb alone does not ship qwen3_worker/zipformer_worker correctly.
+[package.metadata.deb]
+maintainer = "xai-dict contributors <noreply@users.noreply.github.com>"
+section = "sound"
+priority = "optional"
+extended-description = """\
+LazyTyper-style global hotkey dictation for Linux.
+Models are downloaded separately via `xai-dict config`."""
+depends = "$auto, libnotify-bin, python3, pipewire-bin | pulseaudio-utils | alsa-utils"
+recommends = "python3-pyqt6 | python3-pyqt5, wl-clipboard, fcitx5"
+assets = [
+  ["target/release/xai-dict", "usr/bin/", "755"],
+  ["scripts/settings_gui.py", "usr/share/xai-dict/", "755"],
+]
 
 [dependencies]
 anyhow = "1"

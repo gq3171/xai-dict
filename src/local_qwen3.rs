@@ -288,21 +288,30 @@ fn find_worker_bin() -> Option<PathBuf> {
             }
         }
     }
-    // 3) User data
+    // 3) Debian/system package layout
+    for p in [
+        PathBuf::from("/usr/lib/xai-dict/qwen3_worker"),
+        PathBuf::from("/usr/libexec/xai-dict/qwen3_worker"),
+    ] {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // 4) User data
     if let Some(data) = dirs::data_local_dir() {
         let p = data.join("xai-dict/bin/qwen3_worker");
         if p.is_file() {
             return Some(p);
         }
     }
-    // 4) cargo bin
+    // 5) cargo bin
     if let Some(home) = dirs::home_dir() {
         let p = home.join(".cargo/bin/qwen3_worker");
         if p.is_file() {
             return Some(p);
         }
     }
-    // 5) PATH
+    // 6) PATH
     which_bin("qwen3_worker")
 }
 

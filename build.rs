@@ -7,12 +7,14 @@ fn compile_worker(name: &str, src_rel: &str, out_dir: &PathBuf, manifest: &PathB
     let dest = out_dir.join(name);
     println!("cargo:rerun-if-changed={src_rel}");
 
+    // $ORIGIN so packaged workers find bundled libs under /usr/lib/xai-dict/
     let status = Command::new("gcc")
         .args([
             "-O2",
             "-o",
             dest.to_str().unwrap(),
             src.to_str().unwrap(),
+            "-Wl,-rpath,$ORIGIN",
             "-lsherpa-onnx-c-api",
             "-lonnxruntime",
             "-lm",

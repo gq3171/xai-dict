@@ -14,6 +14,14 @@ pub fn settings_script_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    for p in [
+        PathBuf::from("/usr/share/xai-dict/settings_gui.py"),
+        PathBuf::from("/usr/lib/xai-dict/settings_gui.py"),
+    ] {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     if let Some(data) = dirs::data_local_dir() {
         let p = data.join("xai-dict/settings_gui.py");
         if p.is_file() {

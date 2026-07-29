@@ -400,6 +400,14 @@ fn find_worker_bin() -> Option<PathBuf> {
             }
         }
     }
+    for p in [
+        PathBuf::from("/usr/lib/xai-dict/zipformer_worker"),
+        PathBuf::from("/usr/libexec/xai-dict/zipformer_worker"),
+    ] {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     if let Some(data) = dirs::data_local_dir() {
         let p = data.join("xai-dict/bin/zipformer_worker");
         if p.is_file() {

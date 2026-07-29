@@ -15,19 +15,37 @@ Linux 语音听写（LazyTyper 风格）：**全局快捷键 → 说话 → 文�
 └─────────────────────────────────────────────┘
 ```
 
-## 快速开始（输入法式）
+## 安装
+
+### Debian / Ubuntu（`.deb`，推荐）
+
+从 [GitHub Releases](https://github.com/gq3171/xai-dict/releases) 下载：
+
+```bash
+sudo dpkg -i xai-dict_*_amd64.deb
+# 若缺依赖：sudo apt -f install
+xai-dict config          # 图形界面下载模型
+systemctl --user daemon-reload
+systemctl --user enable --now xai-dict
+```
+
+本地打包（开发机需已装 `sherpa-onnx` C API + `onnxruntime`）：
+
+```bash
+./packaging/build-deb.sh
+# → target/debian/xai-dict_<version>_amd64.deb
+```
+
+**模型不进 deb**（约 2GB+），用设置界面「下载并应用」。
+
+### 从源码（Arch 等）
 
 ```bash
 # 依赖
 sudo pacman -S sherpa-onnx wl-clipboard wtype xdotool libnotify pipewire
 
-# 模型 ~1.9GB（若尚未下载）
-mkdir -p ~/.local/share/xai-dict/models && cd ~/.local/share/xai-dict/models
-curl -fL -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2
-tar xjf sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2 && rm *.tar.bz2
+# 模型：xai-dict config 里一键下载，或手动放到 ~/.local/share/xai-dict/models
 
-# 安装并启动守护进程
-cd ~/Projects/rust/xai-dict
 cargo install --path .
 xai-dict install
 ```
@@ -70,6 +88,9 @@ journalctl --user -u xai-dict -f
 | `xai-dict` / `dict` | 一次性终端听写（Enter 结束） |
 | `xai-dict --provider local` | 改用 Whisper |
 | `xai-dict --provider xai` | 云端 xAI STT |
+| `./packaging/build-deb.sh` | 打 amd64 `.deb`（不含模型） |
+
+打 tag 发版会走 GitHub Actions：`git tag v0.1.0 && git push github v0.1.0`
 
 ## 配置
 
